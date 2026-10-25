@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>MailCheck — The Dead Letter Office</title>
+  <meta name="description" content="Bulk email address verification. Paste addresses, get honest results.">
+  <link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+  <!-- ============================================================
+       HIDDEN SVG FILTERS
+       ============================================================ -->
+  <svg xmlns="http://www.w3.org/2000/svg" width="0" height="0" style="position:absolute" aria-hidden="true">
+    <defs>
+      <!-- Paper grain texture filter -->
+      <filter id="paper-grain" x="0%" y="0%" width="100%" height="100%">
+        <feTurbulence type="fractalNoise" baseFrequency="0.8" numOctaves="2" stitchTiles="stitch" result="grain"/>
+        <feColorMatrix type="saturate" values="0" in="grain" result="bw"/>
+      </filter>
+
+      <!-- Ink roughness filter for stamps -->
+      <filter id="ink-rough" x="-5%" y="-5%" width="110%" height="110%">
+        <feTurbulence type="turbulence" baseFrequency="0.04" numOctaves="4" seed="2" result="noise"/>
+        <feDisplacementMap in="SourceGraphic" in2="noise" scale="2" xChannelSelector="R" yChannelSelector="G"/>
+      </filter>
+    </defs>
+  </svg>
+
+  <!-- Paper grain overlay -->
+  <div class="paper-grain" aria-hidden="true">
+    <svg width="100%" height="100%" xmlns="http://www.w3.org/2000/svg">
+      <filter id="grain-overlay">
+        <feTurbulence type="fractalNoise" baseFrequency="0.8" numOctaves="2" stitchTiles="stitch"/>
+      </filter>
+      <rect width="100%" height="100%" filter="url(#grain-overlay)"/>
+    </svg>
+  </div>
+
+  <div class="page-wrapper">
+
+    <!-- ============================================================
+         MASTHEAD
+         ============================================================ -->
+    <header class="masthead">
+      <h1 class="masthead-title" data-text="MAILCHECK">MAILCHECK</h1>
+      <p class="masthead-subtitle">Dead Letter Office — address verification</p>
+      <div class="postmark-date" aria-label="Today's date">
+        <span class="postmark-city">MAILCHECK</span>
+        <span class="postmark-day" id="postmark-day"></span>
+        <span class="postmark-month-year" id="postmark-month-year"></span>
+      </div>
+    </header>
+
+    <!-- ============================================================
+         INTAKE SLIP
+         ============================================================ -->
+    <section class="intake-slip" id="intake-slip" aria-labelledby="intake-label">
+      <label class="intake-slip-label" id="intake-label" for="email-input">Paste addresses, one per line</label>
+      <div class="intake-textarea-wrap">
+        <textarea
+          class="intake-textarea"
+          id="email-input"
+          rows="10"
+          placeholder="alice@gmail.com&#10;bob@company.com&#10;wrong-email&#10;someone@nonexistent-domain-xyz.com"
+          spellcheck="false"
+          autocomplete="off"
+        ></textarea>
+      </div>
+      <div class="intake-meta">
+        <span class="address-counter" id="address-counter" aria-live="polite">0 addresses · max 1,000</span>
+        <div class="validation-note" id="validation-note" role="alert">
+          Too many addresses. The sorting office handles up to 1,000 at a time.
+        </div>
+      </div>
+      <div class="intake-buttons">
+        <button class="btn btn-primary" id="verify-btn" type="button">Verify</button>
+        <button class="btn btn-secondary" id="clear-btn" type="button">Clear</button>
+        <button class="btn btn-tertiary" id="sample-btn" type="button">Load sample</button>
+      </div>
+    </section>
+
+    <!-- Collapsed intake summary -->
+    <div class="intake-collapsed" id="intake-collapsed">
+      <span id="intake-summary-text"></span>
+      <button class="edit-list-btn" id="edit-list-btn" type="button">Edit list</button>
+    </div>
+
+    <hr class="section-divider" id="results-divider" style="display:none">
+
+    <!-- ============================================================
+         PIGEONHOLES (Summary & Filter Cubbies)
+         ============================================================ -->
+    <nav class="pigeonholes" id="pigeonholes" aria-label="Filter results by status">
+      <button class="pigeonhole" data-filter="all" aria-pressed="true" type="button">
+        <span class="pigeonhole-count" id="count-all">0</span>
+        <span class="pigeonhole-label">All</span>
+      </button>
+      <button class="pigeonhole" data-filter="likely_deliverable" aria-pressed="false" type="button">
+        <span class="pigeonhole-count" id="count-likely_deliverable">0</span>
+        <span class="pigeonhole-label">Likely Deliverable</span>
+      </button>
+      <button class="pigeonhole" data-filter="likely_bounce" aria-pressed="false" type="button">
+        <span class="pigeonhole-count" id="count-likely_bounce">0</span>
+        <span class="pigeonhole-label">Likely Bounce</span>
+      </button>
+      <button class="pigeonhole" data-filter="unknown" aria-pressed="false" type="button">
+        <span class="pigeonhole-count" id="count-unknown">0</span>
+        <span class="pigeonhole-label">Unknown</span>
+      </button>
+    </nav>
+
+    <!-- ============================================================
+         PROGRESS STRIP
+         ============================================================ -->
+    <div class="progress-strip" id="progress-strip" aria-live="polite" role="status">
+      Sorting…
+    </div>
+
+    <!-- ============================================================
+         ERROR BANNER
+         ============================================================ -->
+    <div class="error-banner" id="error-banner" role="alert">
+      <span id="error-message">The request failed. Nothing was sent to any address.</span>
+      <button class="btn btn-secondary" id="retry-btn" type="button">Try again</button>
+    </div>
+
+    <!-- ============================================================
+         EXPORT BUTTONS
+         ============================================================ -->
+    <div class="export-buttons" id="export-buttons">
+      <button class="btn btn-secondary" id="csv-btn" type="button">Bundle results (CSV)</button>
+      <button class="btn btn-secondary" id="copy-btn" type="button">Copy results</button>
+    </div>
+
+    <!-- ============================================================
+         LEDGER (Results Table)
+         ============================================================ -->
+    <div class="ledger-wrap" id="ledger-wrap">
+      <table class="ledger" id="ledger">
+        <caption>Verification Ledger</caption>
+        <thead>
+          <tr>
+            <th scope="col">#</th>
+            <th scope="col" class="sortable" tabindex="0" role="columnheader" aria-sort="none" data-sort="address">
+              Address <span class="sort-arrow"></span>
+            </th>
+            <th scope="col" class="sortable" tabindex="0" role="columnheader" aria-sort="none" data-sort="status">
+              Status <span class="sort-arrow"></span>
+            </th>
+            <th scope="col">Reason</th>
+            <th scope="col">Postmarks</th>
+          </tr>
+        </thead>
+        <tbody id="ledger-body">
+        </tbody>
+      </table>
+    </div>
+
+    <!-- ============================================================
+         FOOTNOTE & PRIVACY
+         ============================================================ -->
+    <footer class="footnote" id="footnote">
+      <p>A postmark proves a letter was posted, not that anyone lives at the address. MX records show that a domain can receive mail, not that a particular mailbox exists. Results are predictions, not guarantees.</p>
+      <p>Addresses are checked and discarded. Nothing is stored and no emails are sent.</p>
+      <div class="footnote-controls">
+        <button class="plain-view-btn" id="plain-view-btn" type="button" aria-pressed="false" data-texture="off">Plain view</button>
+      </div>
+    </footer>
+
+  </div><!-- /.page-wrapper -->
+
+  <script type="module" src="app.js"></script>
+</body>
+</html>

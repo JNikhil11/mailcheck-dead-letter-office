@@ -1,0 +1,18 @@
+{
+  "name": "mailcheck",
+  "version": "1.0.0",
+  "description": "MailCheck — The Dead Letter Office. Bulk email address verification.",
+  "type": "module",
+  "scripts": {
+    "dev": "node server.js",
+    "start": "node server.js",
+    "test": "node --test tests/verify.test.js"
+  },
+  "dependencies": {
+    "validator": "^13.12.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "license": "MIT"
+}
