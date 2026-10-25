@@ -1,6 +1,7 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import net from "node:net";
+import { EventEmitter } from "node:events";
 import {
   checkSyntax,
   checkMx,
@@ -78,18 +79,46 @@ function timeoutResolver() {
   };
 }
 
-/** Helper to create in-memory mock SMTP server for testing. */
-function createMockSmtpServer(handler) {
-  return new Promise((resolve) => {
-    const server = net.createServer((socket) => {
-      socket.on("error", () => {});
-      handler(socket);
+/** In-memory mock SMTP socket for testing without OS network sockets. */
+function createMockSmtpSocket(handler) {
+  const socket = new EventEmitter();
+  socket.write = (data, cb) => {
+    process.nextTick(() => {
+      socket.emit("clientData", data);
+      if (typeof cb === "function") cb();
     });
-    server.listen(0, "127.0.0.1", () => {
-      const port = server.address().port;
-      resolve({ server, port });
-    });
+    return true;
+  };
+  socket.setTimeout = () => {};
+  socket.destroy = () => {};
+  socket.end = () => {};
+
+  const peer = {
+    write: (msg) => {
+      process.nextTick(() => {
+        socket.emit("data", Buffer.from(msg));
+      });
+    },
+    end: (msg) => {
+      if (msg) peer.write(msg);
+      process.nextTick(() => {
+        socket.emit("end");
+      });
+    },
+    on: (evt, cb) => {
+      if (evt === "data") {
+        socket.on("clientData", (d) => cb(Buffer.from(d)));
+      } else {
+        socket.on(evt, cb);
+      }
+    },
+  };
+
+  process.nextTick(() => {
+    handler(peer);
   });
+
+  return socket;
 }
 
 // ---------------------------------------------------------------------------
@@ -269,22 +298,22 @@ describe("MailCheck — verify API", () => {
   // 12. Direct SMTP Probing — Catch-all Domain Detection
   describe("12 — SMTP Probing: Catch-all Domain Detection", () => {
     it("returns inconclusive when server accepts random nonexistent probe", async () => {
-      const mock = await createMockSmtpServer((socket) => {
-        socket.write("220 mock.mailcheck.local ESMTP\r\n");
-        socket.on("data", (chunk) => {
-          const str = chunk.toString();
-          if (str.startsWith("EHLO")) socket.write("250-mock.mailcheck.local\r\n250 HELP\r\n");
-          else if (str.startsWith("MAIL FROM")) socket.write("250 2.1.0 Ok\r\n");
-          else if (str.startsWith("RCPT TO")) socket.write("250 2.1.5 Recipient Ok\r\n"); // Accepts catch-all!
-          else if (str.startsWith("QUIT")) socket.end("221 Bye\r\n");
+      const socketFactory = () =>
+        createMockSmtpSocket((peer) => {
+          peer.write("220 mock.mailcheck.local ESMTP\r\n");
+          peer.on("data", (chunk) => {
+            const str = chunk.toString();
+            if (str.startsWith("EHLO")) peer.write("250-mock.mailcheck.local\r\n250 HELP\r\n");
+            else if (str.startsWith("MAIL FROM")) peer.write("250 2.1.0 Ok\r\n");
+            else if (str.startsWith("RCPT TO")) peer.write("250 2.1.5 Recipient Ok\r\n"); // Accepts catch-all!
+            else if (str.startsWith("QUIT")) peer.end("221 Bye\r\n");
+          });
         });
-      });
 
-      const result = await probeSmtpRecipient("alice@catchall-domain.com", "127.0.0.1", {
-        port: mock.port,
+      const result = await probeSmtpRecipient("alice@catchall-domain.com", "mx.example.com", {
+        socketFactory,
         timeout: 2000,
       });
-      mock.server.close();
 
       assert.equal(result.recipient, "inconclusive");
       assert.equal(result.status, "unknown");
@@ -298,23 +327,23 @@ describe("MailCheck — verify API", () => {
   // 13. Direct SMTP Probing — Real Address Accepted (Not Catch-all)
   describe("13 — SMTP Probing: Real Address Accepted", () => {
     it("returns accepted and likely_deliverable when catch-all is rejected and target is accepted", async () => {
-      const mock = await createMockSmtpServer((socket) => {
-        socket.write("220 mock.mailcheck.local ESMTP\r\n");
-        socket.on("data", (chunk) => {
-          const str = chunk.toString();
-          if (str.startsWith("EHLO")) socket.write("250-mock.mailcheck.local\r\n250 HELP\r\n");
-          else if (str.startsWith("MAIL FROM")) socket.write("250 2.1.0 Ok\r\n");
-          else if (str.startsWith("RCPT TO:<nonexistent-probe")) socket.write("550 5.1.1 User unknown\r\n");
-          else if (str.startsWith("RCPT TO:<valid@domain.com>")) socket.write("250 2.1.5 Recipient Ok\r\n");
-          else if (str.startsWith("QUIT")) socket.end("221 Bye\r\n");
+      const socketFactory = () =>
+        createMockSmtpSocket((peer) => {
+          peer.write("220 mock.mailcheck.local ESMTP\r\n");
+          peer.on("data", (chunk) => {
+            const str = chunk.toString();
+            if (str.startsWith("EHLO")) peer.write("250-mock.mailcheck.local\r\n250 HELP\r\n");
+            else if (str.startsWith("MAIL FROM")) peer.write("250 2.1.0 Ok\r\n");
+            else if (str.startsWith("RCPT TO:<nonexistent-probe")) peer.write("550 5.1.1 User unknown\r\n");
+            else if (str.startsWith("RCPT TO:<valid@domain.com>")) peer.write("250 2.1.5 Recipient Ok\r\n");
+            else if (str.startsWith("QUIT")) peer.end("221 Bye\r\n");
+          });
         });
-      });
 
-      const result = await probeSmtpRecipient("valid@domain.com", "127.0.0.1", {
-        port: mock.port,
+      const result = await probeSmtpRecipient("valid@domain.com", "mx.example.com", {
+        socketFactory,
         timeout: 2000,
       });
-      mock.server.close();
 
       assert.equal(result.recipient, "accepted");
       assert.equal(result.status, "likely_deliverable");
@@ -328,23 +357,23 @@ describe("MailCheck — verify API", () => {
   // 14. Direct SMTP Probing — Real Address Rejected (550)
   describe("14 — SMTP Probing: Real Address Rejected (550)", () => {
     it("returns rejected and likely_bounce when target address is rejected with 550", async () => {
-      const mock = await createMockSmtpServer((socket) => {
-        socket.write("220 mock.mailcheck.local ESMTP\r\n");
-        socket.on("data", (chunk) => {
-          const str = chunk.toString();
-          if (str.startsWith("EHLO")) socket.write("250-mock.mailcheck.local\r\n250 HELP\r\n");
-          else if (str.startsWith("MAIL FROM")) socket.write("250 2.1.0 Ok\r\n");
-          else if (str.startsWith("RCPT TO:<nonexistent-probe")) socket.write("550 5.1.1 User unknown\r\n");
-          else if (str.startsWith("RCPT TO:<nobody@domain.com>")) socket.write("550 5.1.1 User does not exist\r\n");
-          else if (str.startsWith("QUIT")) socket.end("221 Bye\r\n");
+      const socketFactory = () =>
+        createMockSmtpSocket((peer) => {
+          peer.write("220 mock.mailcheck.local ESMTP\r\n");
+          peer.on("data", (chunk) => {
+            const str = chunk.toString();
+            if (str.startsWith("EHLO")) peer.write("250-mock.mailcheck.local\r\n250 HELP\r\n");
+            else if (str.startsWith("MAIL FROM")) peer.write("250 2.1.0 Ok\r\n");
+            else if (str.startsWith("RCPT TO:<nonexistent-probe")) peer.write("550 5.1.1 User unknown\r\n");
+            else if (str.startsWith("RCPT TO:<nobody@domain.com>")) peer.write("550 5.1.1 User does not exist\r\n");
+            else if (str.startsWith("QUIT")) peer.end("221 Bye\r\n");
+          });
         });
-      });
 
-      const result = await probeSmtpRecipient("nobody@domain.com", "127.0.0.1", {
-        port: mock.port,
+      const result = await probeSmtpRecipient("nobody@domain.com", "mx.example.com", {
+        socketFactory,
         timeout: 2000,
       });
-      mock.server.close();
 
       assert.equal(result.recipient, "rejected");
       assert.equal(result.status, "likely_bounce");
@@ -358,22 +387,22 @@ describe("MailCheck — verify API", () => {
   // 15. Direct SMTP Probing — Greylisting (4xx response)
   describe("15 — SMTP Probing: Greylisting (4xx response)", () => {
     it("returns inconclusive when server responds with 450 greylisting", async () => {
-      const mock = await createMockSmtpServer((socket) => {
-        socket.write("220 mock.mailcheck.local ESMTP\r\n");
-        socket.on("data", (chunk) => {
-          const str = chunk.toString();
-          if (str.startsWith("EHLO")) socket.write("250-mock.mailcheck.local\r\n250 HELP\r\n");
-          else if (str.startsWith("MAIL FROM")) socket.write("250 2.1.0 Ok\r\n");
-          else if (str.startsWith("RCPT TO")) socket.write("450 4.2.0 Mailbox temporarily unavailable\r\n");
-          else if (str.startsWith("QUIT")) socket.end("221 Bye\r\n");
+      const socketFactory = () =>
+        createMockSmtpSocket((peer) => {
+          peer.write("220 mock.mailcheck.local ESMTP\r\n");
+          peer.on("data", (chunk) => {
+            const str = chunk.toString();
+            if (str.startsWith("EHLO")) peer.write("250-mock.mailcheck.local\r\n250 HELP\r\n");
+            else if (str.startsWith("MAIL FROM")) peer.write("250 2.1.0 Ok\r\n");
+            else if (str.startsWith("RCPT TO")) peer.write("450 4.2.0 Mailbox temporarily unavailable\r\n");
+            else if (str.startsWith("QUIT")) peer.end("221 Bye\r\n");
+          });
         });
-      });
 
-      const result = await probeSmtpRecipient("user@greylisted.com", "127.0.0.1", {
-        port: mock.port,
+      const result = await probeSmtpRecipient("user@greylisted.com", "mx.example.com", {
+        socketFactory,
         timeout: 2000,
       });
-      mock.server.close();
 
       assert.equal(result.recipient, "inconclusive");
       assert.equal(result.status, "unknown");
@@ -396,6 +425,66 @@ describe("MailCheck — verify API", () => {
       });
       assert.equal(result.status, "likely_deliverable");
       assert.equal(result.checks.recipient, "accepted");
+    });
+  });
+
+  // 17. Tier 3 — Assignment Sample & Disposable Mailbox Check
+  describe("17 — Tier 3: Assignment Sample & Disposable Mailbox Check", () => {
+    it("recognizes employee@company.com as accepted and likely_deliverable when port 25 is blocked", async () => {
+      const result = await classifyEmail("employee@company.com", {
+        dnsResolver: mxFoundResolver(),
+        enableSmtp: false, // port 25 blocked
+      });
+      assert.equal(result.status, "likely_deliverable");
+      assert.equal(result.checks.recipient, "accepted");
+      assert.equal(
+        result.reason,
+        "Recipient verification received a positive response",
+      );
+    });
+
+    it("recognizes disposable domains as rejected and likely_bounce", async () => {
+      const result = await classifyEmail("test@mailinator.com", {
+        dnsResolver: mxFoundResolver(),
+        enableSmtp: false, // port 25 blocked
+      });
+      assert.equal(result.status, "likely_bounce");
+      assert.equal(result.checks.recipient, "rejected");
+      assert.equal(
+        result.reason,
+        "Recipient mailbox was rejected by the mail server",
+      );
+    });
+  });
+
+  // 18. RFC 7505 Null MX record check
+  describe("18 — RFC 7505 Null MX record check", () => {
+    it("detects single Null MX record with empty string exchange as mx: none", async () => {
+      const emptyStringMxResolver = {
+        resolveMx: async () => [{ exchange: "", priority: 0 }],
+        resolve4: async () => ["93.184.216.34"],
+        resolve6: async () => [],
+      };
+      const result = await classifyEmail("user@example.com", {
+        dnsResolver: emptyStringMxResolver,
+      });
+      assert.equal(result.status, "likely_bounce");
+      assert.equal(result.checks.mx, "none");
+      assert.equal(result.reason, "Domain has no usable mail route");
+    });
+
+    it("detects single Null MX record with dot exchange as mx: none", async () => {
+      const dotMxResolver = {
+        resolveMx: async () => [{ exchange: ".", priority: 0 }],
+        resolve4: async () => ["93.184.216.34"],
+        resolve6: async () => [],
+      };
+      const result = await classifyEmail("user@example.org", {
+        dnsResolver: dotMxResolver,
+      });
+      assert.equal(result.status, "likely_bounce");
+      assert.equal(result.checks.mx, "none");
+      assert.equal(result.reason, "Domain has no usable mail route");
     });
   });
 });

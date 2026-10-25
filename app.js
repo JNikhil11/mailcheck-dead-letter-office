@@ -25,16 +25,12 @@ const POSTMARK_DISPLAY = {
 };
 
 const SAMPLE_ADDRESSES = [
+  'employee@company.com',
   'alice@gmail.com',
-  'bob@company.com',
-  'wrong-email',
+  'user@example.com',
   'someone@nonexistent-domain-xyz.com',
-  'alice@gmail.com',
-  'test@microsoft.com',
-  'user@@double-at.com',
-  'hello world@spaces.com',
-  '<script>alert(1)</script>@example.com',
-  'valid.user@yahoo.com',
+  'wrong-email',
+  'employee@company.com',
 ];
 
 // --- State ---

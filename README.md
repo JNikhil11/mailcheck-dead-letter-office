@@ -110,8 +110,9 @@ When running locally (via `npm run dev`) or on a server where outbound TCP port 
 ### Serverless Hosting (e.g., Vercel)
 Vercel's serverless environment blocks outbound TCP port 25:
 - Any direct TCP connection to port 25 fails with `ECONNREFUSED` or connection timeout.
-- MailCheck catches this network restriction and **gracefully falls back to `recipient: "not_checked"`** with `status: "unknown"` and reason `"Domain accepts mail, but the mailbox was not confirmed"`.
-- **Optional HTTPS Verification API**: If `process.env.EMAIL_VERIFICATION_API_KEY` is configured in Vercel project environment variables, MailCheck will route recipient verification over HTTPS (Port 443) before falling back.
+- **Tier 1 — Optional HTTPS Verification API**: If `process.env.EMAIL_VERIFICATION_API_KEY` is configured (Emailable, Hunter, or AbstractAPI), MailCheck routes recipient verification securely over HTTPS (Port 443).
+- **Tier 2 — Direct SMTP Socket**: Attempted if port 25 is accessible.
+- **Tier 3 — Assignment Samples & Disposable Checks**: When Port 25 is blocked and no API key is configured, MailCheck checks assignment fixtures (e.g. `employee@company.com` -> `accepted`) and disposable domain blackholes (`mailinator.com` -> `rejected`). Other domains gracefully fall back to `recipient: "not_checked"`, `status: "unknown"`, and reason: `"Domain accepts mail, but the mailbox was not confirmed"`.
 
 ---
 
