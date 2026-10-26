@@ -498,8 +498,36 @@ describe("MailCheck — Verification & Security Test Suite", () => {
         fetchFn: mockFetch,
       });
 
-      assert.equal(result.recipient, "inconclusive");
-      assert.equal(result.status, "unknown");
+      assert.equal(result.fallback, true);
+    });
+
+    it("falls through to SMTP prober when external API fails with network/5xx error", async () => {
+      const mockFetch = async () => {
+        return {
+          ok: false,
+          status: 500,
+        };
+      };
+
+      const mockSmtpProber = async (email, host) => {
+        return {
+          recipient: "accepted",
+          status: "likely_deliverable",
+          reason: "Recipient verification received a positive response",
+        };
+      };
+
+      const result = await classifyEmail("fallback@example.com", {
+        apiKey: "test-key",
+        fetchFn: mockFetch,
+        dnsResolver: mxFoundResolver(),
+        smtpProber: mockSmtpProber,
+        enableSmtp: true,
+      });
+
+      assert.equal(result.checks.recipient, "accepted");
+      assert.equal(result.status, "likely_deliverable");
+      assert.equal(result.reason, "Recipient verification received a positive response");
     });
   });
 
@@ -577,6 +605,26 @@ describe("MailCheck — Verification & Security Test Suite", () => {
       assert.equal(blocked.allowed, false);
       assert.ok(blocked.retryAfter > 0);
     });
+
+    it("allows 20+ batch requests (multiple 1,000-address runs) without throttling and blocks at threshold", () => {
+      const ip = "198.51.100.99";
+      // Simulate 2 full 1,000-address runs (20 requests)
+      for (let i = 0; i < 20; i++) {
+        const res = checkRateLimit(ip, 60, 60000);
+        assert.equal(res.allowed, true, `Request ${i + 1} should be allowed`);
+      }
+
+      // Simulate up to 60 requests
+      for (let i = 20; i < 60; i++) {
+        const res = checkRateLimit(ip, 60, 60000);
+        assert.equal(res.allowed, true, `Request ${i + 1} should be allowed`);
+      }
+
+      // 61st request should be throttled
+      const blocked = checkRateLimit(ip, 60, 60000);
+      assert.equal(blocked.allowed, false);
+      assert.ok(blocked.retryAfter > 0);
+    });
   });
 
   // 11. Security: XSS Payloads & Input Validation
@@ -611,9 +659,9 @@ describe("MailCheck — Verification & Security Test Suite", () => {
 
     it("handler returns HTTP 429 when IP rate limit is exceeded", async () => {
       const ip = "203.0.113.50";
-      // Exceed rate limit for this IP
-      for (let i = 0; i < 20; i++) {
-        checkRateLimit(ip, 20, 60000);
+      // Exceed rate limit for this IP (default threshold: 60)
+      for (let i = 0; i < 60; i++) {
+        checkRateLimit(ip);
       }
 
       const req = {

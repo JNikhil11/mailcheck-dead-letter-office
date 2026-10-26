@@ -19,12 +19,29 @@ export const SMTP_TIMEOUT_MS = 2500;
 export const STAGE3_CONCURRENCY = 10;
 export const DNS_CONCURRENCY = 10;
 
-// Rate limiting: 20 requests per 60 seconds per IP
+// Rate limiting: 60 requests per 60 seconds per IP (configurable via RATE_LIMIT_MAX)
 export const RATE_LIMIT_WINDOW_MS = 60000;
-export const RATE_LIMIT_MAX_REQUESTS = 20;
+export const RATE_LIMIT_MAX_REQUESTS = parseInt(process.env.RATE_LIMIT_MAX || "60", 10) || 60;
 
 // In-memory sliding-window IP rate limiter map: IP -> timestamp[]
 const ipRateLimitMap = new Map();
+
+/**
+ * Prune expired entries from the rate limit map when it exceeds 1,000 keys.
+ */
+function pruneRateLimitMap(now, windowMs) {
+  if (ipRateLimitMap.size > 1000) {
+    const windowStart = now - windowMs;
+    for (const [ip, timestamps] of ipRateLimitMap.entries()) {
+      const active = timestamps.filter((t) => t > windowStart);
+      if (active.length === 0) {
+        ipRateLimitMap.delete(ip);
+      } else {
+        ipRateLimitMap.set(ip, active);
+      }
+    }
+  }
+}
 
 /**
  * Reset rate limit tracker (for testing).
@@ -42,6 +59,8 @@ export function resetRateLimits() {
  */
 export function checkRateLimit(ip, maxRequests = RATE_LIMIT_MAX_REQUESTS, windowMs = RATE_LIMIT_WINDOW_MS) {
   const now = Date.now();
+  pruneRateLimitMap(now, windowMs);
+
   let timestamps = ipRateLimitMap.get(ip);
   if (!timestamps) {
     timestamps = [];
@@ -434,6 +453,20 @@ export function isExplicitMailboxNotFound(code, line) {
 }
 
 /**
+ * Validate that an EHLO/HELO hostname is a valid FQDN (contains at least one dot
+ * and does not end with local/internal/lan).
+ * @param {string} domain
+ * @returns {boolean}
+ */
+export function isValidHeloDomain(domain) {
+  if (!domain || typeof domain !== "string") return false;
+  const s = domain.trim().toLowerCase();
+  if (!s.includes(".")) return false;
+  if (s.endsWith(".local") || s.endsWith(".internal") || s.endsWith(".lan")) return false;
+  return true;
+}
+
+/**
  * Perform a lightweight non-sending SMTP probe on port 25.
  * Strictly sends only EHLO, MAIL FROM, and RCPT TO.
  * NEVER sends DATA or any email body. Always sends QUIT and closes socket immediately.
@@ -450,13 +483,23 @@ export async function probeSmtpRecipient(email, mxHost, options = {}) {
   const randomProbe = `nonexistent-probe-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}@${domain}`;
 
   // Configurable HELO/EHLO domain and MAIL FROM
-  const heloDomain =
+  const env = options.env || process.env;
+  const configuredHelo =
     options.heloDomain ||
-    process.env.SMTP_HELO_DOMAIN ||
-    (typeof os.hostname === "function" ? os.hostname() : "") ||
-    "mailcheck.org";
+    env.SMTP_HELO_DOMAIN ||
+    (typeof os.hostname === "function" ? os.hostname() : "");
 
-  const mailFrom = options.mailFrom !== undefined ? options.mailFrom : (process.env.SMTP_MAIL_FROM || "");
+  // If running real network socket probe (not mock) and HELO domain is not a valid FQDN:
+  if (typeof options.socketFactory !== "function" && !isValidHeloDomain(configuredHelo)) {
+    return {
+      recipient: "not_checked",
+      status: "unknown",
+      reason: "Domain accepts mail, but the mailbox was not confirmed",
+    };
+  }
+
+  const heloDomain = configuredHelo || "mx.example.com";
+  const mailFrom = options.mailFrom !== undefined ? options.mailFrom : (env.SMTP_MAIL_FROM || "");
 
   // SSRF Protection: verify resolved IP is public before connecting
   if (typeof options.socketFactory !== "function") {
@@ -764,11 +807,7 @@ export async function checkRecipientViaHttps(email, options = {}) {
     });
 
     if (!res.ok) {
-      return {
-        recipient: "inconclusive",
-        status: "unknown",
-        reason: "Domain accepts mail, but the mailbox was not confirmed",
-      };
+      return { fallback: true };
     }
 
     const data = await res.json();
@@ -804,11 +843,7 @@ export async function checkRecipientViaHttps(email, options = {}) {
       reason: "Domain accepts mail, but the mailbox was not confirmed",
     };
   } catch {
-    return {
-      recipient: "inconclusive",
-      status: "unknown",
-      reason: "Domain accepts mail, but the mailbox was not confirmed",
-    };
+    return { fallback: true };
   } finally {
     clearTimeout(timer);
   }
@@ -916,7 +951,7 @@ export async function classifyEmail(email, options = {}) {
   // 2. External HTTPS Verification API
   if (env.EMAIL_VERIFICATION_API_KEY || apiKey) {
     const apiResult = await checkRecipientViaHttps(email, options);
-    if (apiResult) {
+    if (apiResult && !apiResult.fallback) {
       return {
         email,
         status: apiResult.status,
@@ -926,9 +961,12 @@ export async function classifyEmail(email, options = {}) {
     }
   }
 
-  // 3. Direct SMTP Port 25 Probing (disabled by default in serverless / when blocked)
-  const isSmtpExplicitlyEnabled = options.enableSmtp === true || env.ENABLE_SMTP_PROBE === "true";
-  const isVercel = Boolean(env.VERCEL);
+  // 3. Direct SMTP Port 25 Probing (attempted if enabled or when falling through from external API)
+  const isSmtpExplicitlyEnabled =
+    options.enableSmtp === true ||
+    env.ENABLE_SMTP_PROBE === "true" ||
+    typeof options.smtpProber === "function";
+  const isVercel = Boolean(env.VERCEL) && !options.enableSmtp && typeof options.smtpProber !== "function";
   const shouldAttemptSmtp = isSmtpExplicitlyEnabled && !isVercel;
 
   if (shouldAttemptSmtp) {
@@ -1139,14 +1177,18 @@ export async function verifyBatch(emails, options = {}) {
  */
 export function getClientIp(req) {
   const xForwardedFor = req.headers && req.headers["x-forwarded-for"];
-  if (xForwardedFor) {
+  if (typeof xForwardedFor === "string") {
     const first = xForwardedFor.split(",")[0].trim();
     if (first) return first;
   }
   const xRealIp = req.headers && req.headers["x-real-ip"];
-  if (xRealIp) return xRealIp.trim();
-  if (req.socket && req.socket.remoteAddress) return req.socket.remoteAddress;
-  return "127.0.0.1";
+  if (typeof xRealIp === "string" && xRealIp.trim()) {
+    return xRealIp.trim();
+  }
+  if (req.socket && req.socket.remoteAddress) {
+    return req.socket.remoteAddress;
+  }
+  return "unknown";
 }
 
 /**

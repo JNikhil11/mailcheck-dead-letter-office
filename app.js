@@ -20,7 +20,7 @@ const STATUS_LABELS = {
 const POSTMARK_ABBR = { syntax: 'SYN', mx: 'MX', recipient: 'RCPT' };
 
 const POSTMARK_DISPLAY = {
-  syntax: { pass: 'PASS', fail: 'FAIL' },
+  syntax: { pass: 'PASS', fail: 'FAIL', error: 'ERROR', not_checked: 'NOT CHECKED' },
   mx: { found: 'FOUND', none: 'NONE', domain_not_found: 'DOMAIN NOT FOUND', error: 'ERROR', not_checked: 'NOT CHECKED' },
   recipient: { not_checked: 'NOT CHECKED', accepted: 'ACCEPTED', rejected: 'REJECTED', inconclusive: 'INCONCLUSIVE' },
 };
@@ -205,6 +205,63 @@ function setVerifyingUI(verifying) {
   }
 }
 
+// --- Client-Side Syntax Check for Fallback Rows ---
+function checkClientSyntax(email) {
+  if (typeof email !== 'string') return false;
+  const trimmed = email.trim();
+  if (!trimmed || trimmed.length > 254 || /\s/.test(trimmed)) return false;
+  const parts = trimmed.split('@');
+  if (parts.length !== 2) return false;
+  const [local, domain] = parts;
+  if (!local || !domain || local.length > 64) return false;
+  const labels = domain.split('.');
+  if (labels.length < 2) return false;
+  for (const l of labels) {
+    if (!l || l.startsWith('-') || l.endsWith('-')) return false;
+  }
+  return true;
+}
+
+function upsertChunkResults(results, counts) {
+  for (let i = 0; i < results.length; i++) {
+    const result = results[i];
+    const lowerEmail = result.email.toLowerCase();
+    const count = counts.get(lowerEmail) || 1;
+    const fullResult = { ...result, count };
+
+    // Update or insert into allResults
+    const existingIdx = allResults.findIndex(r => r.email.toLowerCase() === lowerEmail);
+    if (existingIdx !== -1) {
+      allResults[existingIdx] = fullResult;
+    } else {
+      allResults.push(fullResult);
+    }
+
+    // Update or insert into DOM
+    const existingRow = $ledgerBody.querySelector(`tr[data-email="${CSS.escape(result.email)}"]`);
+    const newRow = createResultRow(fullResult, 1, count);
+
+    // Stagger animation for initial items
+    if (i < ANIMATE_FIRST_N) {
+      const stamp = newRow.querySelector('.stamp');
+      if (stamp) {
+        stamp.classList.add('stamp-animate');
+        stamp.style.animationDelay = `${i * STAGGER_MS}ms`;
+        const rotation = stampRotation(result.email);
+        stamp.style.setProperty('--stamp-rotation', `${rotation}deg`);
+      }
+    }
+
+    if (existingRow) {
+      existingRow.replaceWith(newRow);
+    } else {
+      $ledgerBody.appendChild(newRow);
+    }
+  }
+
+  applyFilter();
+}
+
 // --- Verify Flow ---
 async function handleVerify(isRetry = false) {
   if (isVerifying) return;
@@ -274,7 +331,6 @@ async function handleVerify(isRetry = false) {
   }
 
   const totalAddresses = lines.length;
-  let processedCount = allResults.reduce((sum, r) => sum + (r.count || 1), 0);
   let hasFailure = false;
   let failureReason = '';
 
@@ -283,6 +339,7 @@ async function handleVerify(isRetry = false) {
       if (sessionId !== currentSessionId) return;
 
       const chunk = chunksToProcess[ci];
+      const processedCount = allResults.reduce((sum, r) => sum + (r.count || 1), 0);
       $progressStrip.textContent = `Sorted ${processedCount.toLocaleString()} of ${totalAddresses.toLocaleString()}`;
 
       const controller = new AbortController();
@@ -307,31 +364,7 @@ async function handleVerify(isRetry = false) {
         const data = await response.json();
         if (sessionId !== currentSessionId) return;
 
-        // If previously this chunk was rendered as failed, remove old placeholder rows
-        for (const email of chunk) {
-          const lower = email.toLowerCase();
-          const existingIdx = allResults.findIndex(r => r.email.toLowerCase() === lower);
-          if (existingIdx !== -1) {
-            allResults.splice(existingIdx, 1);
-            const oldRow = $ledgerBody.querySelector(`tr[data-email="${CSS.escape(email)}"]`);
-            if (oldRow) oldRow.remove();
-          }
-        }
-
-        // Merge results with duplicate counts
-        for (const result of data.results) {
-          const lowerEmail = result.email.toLowerCase();
-          const count = counts.get(lowerEmail) || 1;
-          allResults.push({ ...result, count });
-        }
-
-        // Render rows
-        renderChunkRows(data.results, counts, ci);
-
-        processedCount += chunk.reduce((sum, email) => {
-          const lower = email.toLowerCase();
-          return sum + (counts.get(lower) || 1);
-        }, 0);
+        upsertChunkResults(data.results, counts);
 
       } catch (err) {
         if (sessionId !== currentSessionId) return;
@@ -340,37 +373,33 @@ async function handleVerify(isRetry = false) {
         failureReason = err.name === 'AbortError' ? 'The request timed out.' : (err.message || 'Network error');
         lastFailedChunks.push(chunk);
 
-        // Render placeholder rows marked as unknown
+        // Render placeholder rows marked as unknown with client-side syntax check
         const failResults = chunk.map(email => ({
           email,
           status: 'unknown',
           reason: 'This batch could not be checked. Try again.',
-          checks: { syntax: 'not_checked', mx: 'not_checked', recipient: 'not_checked' },
+          checks: {
+            syntax: checkClientSyntax(email) ? 'pass' : 'fail',
+            mx: 'not_checked',
+            recipient: 'not_checked',
+          },
         }));
 
-        for (const res of failResults) {
-          const lowerEmail = res.email.toLowerCase();
-          const count = counts.get(lowerEmail) || 1;
-          allResults.push({ ...res, count });
-        }
-
-        renderChunkRows(failResults, counts, ci);
-
-        processedCount += chunk.reduce((sum, email) => {
-          const lower = email.toLowerCase();
-          return sum + (counts.get(lower) || 1);
-        }, 0);
+        upsertChunkResults(failResults, counts);
       } finally {
         clearTimeout(timeoutId);
         activeAbortController = null;
       }
 
       updatePigeonholeCounts(counts);
+      const updatedProcessed = allResults.reduce((sum, r) => sum + (r.count || 1), 0);
+      $progressStrip.textContent = `Sorted ${updatedProcessed.toLocaleString()} of ${totalAddresses.toLocaleString()}`;
     }
   } finally {
     if (sessionId === currentSessionId) {
       isVerifying = false;
       setVerifyingUI(false);
+      updatePigeonholeCounts(counts);
 
       if (lastFailedChunks.length === chunksToProcess.length && chunksToProcess.length > 0) {
         // Complete failure
@@ -402,31 +431,6 @@ function handleRetry() {
   handleVerify(lastFailedChunks.length > 0);
 }
 
-function renderChunkRows(results, counts, chunkIndex) {
-  const startRow = $ledgerBody.children.length;
-
-  results.forEach((result, i) => {
-    const rowIndex = startRow + i;
-    const lowerEmail = result.email.toLowerCase();
-    const count = counts.get(lowerEmail) || 1;
-    const row = createResultRow(result, rowIndex + 1, count);
-
-    // Stagger animation for first ANIMATE_FIRST_N rows of each chunk
-    if (i < ANIMATE_FIRST_N) {
-      const stamp = row.querySelector('.stamp');
-      if (stamp) {
-        stamp.classList.add('stamp-animate');
-        stamp.style.animationDelay = `${i * STAGGER_MS}ms`;
-        const rotation = stampRotation(result.email);
-        stamp.style.setProperty('--stamp-rotation', `${rotation}deg`);
-      }
-    }
-
-    $ledgerBody.appendChild(row);
-  });
-
-  applyFilter();
-}
 
 function createResultRow(result, rowNum, count) {
   const tr = document.createElement('tr');

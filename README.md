@@ -17,10 +17,10 @@ MailCheck accepts up to 1,000 email addresses and returns **Likely Deliverable**
 - **SSRF Protection** — blocks connections to loopback (`127.0.0.0/8`, `::1`), private (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `fc00::/7`), link-local, multicast, and IPv4-mapped private IPv6
 - **Multi-MX Fallback** — stores full priority-sorted MX exchanges and attempts secondary MX hosts if the primary host is unreachable
 - **Narrow 5xx Classification** — strictly narrows SMTP `rejected` verdicts to explicit 550/551/553 mailbox nonexistent responses, classifying policy/reputation/spam blocks (`554`, `5.7.1`) as `unknown`
-- **Application-Level IP Rate Limiting** — sliding-window rate limiter (20 batch requests per 60s per client IP) returning HTTP 429 with `Retry-After: 60`
+- **Application-Level IP Rate Limiting** — sliding-window rate limiter (60 batch requests per 60s per client IP, configurable via `RATE_LIMIT_MAX`) returning HTTP 429 with `Retry-After: 60`
 - **Duplicate collapsing** — identical addresses (case-insensitively deduplicated) show as one row with a `× N` badge; counts still sum correctly
 - **Progressive results & Cancel control** — large batches send in chunks of 100 with interactive cancellation and retry for failed chunks
-- **OWASP CSV sanitization & clipboard copy** — prefixes formulas (`=`, `+`, `-`, `@`) with `'` to prevent spreadsheet injection; copies formatted results with occurrence counts
+- **OWASP CSV sanitization & clipboard copy** — prefixes formulas (`=`, `+`, `-`, `@`, `\t`, `\r` after optional whitespace) with `'` to prevent spreadsheet injection; exports exact 7 columns (`email,status,reason,syntax,mx,recipient,occurrences`) and copies formatted results with occurrence counts
 - **Accessible & High-Contrast** — WCAG contrast compliant red text (`#B3290C`), semantic table, `aria-sort`, `aria-pressed`, `aria-live` progress, and visible focus rings
 - **Reduced motion & Plain view toggle** — respects `prefers-reduced-motion` and allows disabling decorative SVG filters
 - **Privacy-first** — addresses are processed in memory and discarded; nothing is stored and no emails are sent
@@ -70,7 +70,7 @@ Browser (index.html + styles.css + app.js)
   │ POST /api/verify (up to 100 unique addresses per chunk)
   ▼
 Vercel Node.js Function: api/verify.js
-  ├─ enforces IP rate limit (20 req / 60s)
+  ├─ enforces IP rate limit (60 req / 60s, configurable via RATE_LIMIT_MAX)
   ├─ validates request types, string lengths (<2048 chars), and batch limit (max 100)
   ├─ case-insensitively deduplicates emails
   ├─ Stage 1: validates email syntax & RFC 5321 length limits (254 total / 64 local)
@@ -142,8 +142,9 @@ npm test
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `PORT` | No | Local dev server port (default: `3000`) |
+| `RATE_LIMIT_MAX` | No | Maximum batch requests per 60 seconds per IP (default: `60`) |
 | `ENABLE_SMTP_PROBE` | No | Set to `"true"` to enable direct Port 25 SMTP socket probing (default: disabled) |
-| `SMTP_HELO_DOMAIN` | No | FQDN sent in EHLO/HELO commands (default: system hostname or `mailcheck.org`) |
+| `SMTP_HELO_DOMAIN` | No | Valid FQDN sent in EHLO/HELO commands (must contain a dot and not end in `.local`/`.internal`/`.lan`; defaults to valid FQDN hostname) |
 | `SMTP_MAIL_FROM` | No | Address sent in `MAIL FROM:<...>` (default: `<>`) |
 | `EMAIL_VERIFICATION_API_KEY` | No | Optional API key for external HTTPS recipient verification over Port 443 |
 | `EMAIL_VERIFICATION_API_URL` | No | Optional custom verification endpoint URL template |
