@@ -1603,7 +1603,20 @@ export default async function handler(req, res) {
       return res.status(413).json({ error: "Request body exceeds maximum size of 64 KB" });
     }
 
-    const body = req.body;
+    let body = req.body;
+    if (typeof body === "string") {
+      try {
+        body = JSON.parse(body);
+      } catch {
+        return res.status(400).json({ error: "Invalid JSON in request body" });
+      }
+    } else if (Buffer.isBuffer(body)) {
+      try {
+        body = JSON.parse(body.toString("utf-8"));
+      } catch {
+        return res.status(400).json({ error: "Invalid JSON in request body" });
+      }
+    }
     if (!body || !Array.isArray(body.emails)) {
       return res.status(400).json({ error: "Request body must include an emails array" });
     }
@@ -1636,6 +1649,9 @@ export default async function handler(req, res) {
     return res.status(200).json(result);
   } catch (err) {
     console.error("[api/verify] Unexpected error:", err.message || "internal error");
+    if (err instanceof SyntaxError || (err && err.message && /json/i.test(err.message))) {
+      return res.status(400).json({ error: "Invalid JSON in request body" });
+    }
     return res.status(500).json({ error: "Internal server error" });
   }
 }

@@ -254,7 +254,7 @@ Run the automated test suite:
 npm test
 ```
 
-The test suite uses Node's built-in `node:test` runner and executes 80 automated tests across 22 suites with zero external network dependencies:
+The test suite uses Node's built-in `node:test` runner and executes 82 automated tests across 22 suites with zero external network dependencies:
 - **1 — Syntax validation & RFC 5321 length limits** (>254 chars total, >64 local part)
 - **2 — Internationalized email (EAI / IDN)** (IDN punycode & UTF-8 local part)
 - **3 — Domain mail routing & RFC 7505 Null MX detection** (including lazy `gmail.com` canary check for broken sandbox resolvers)

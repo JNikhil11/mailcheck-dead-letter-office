@@ -743,6 +743,38 @@ describe("MailCheck — Verification & Security Test Suite", () => {
       assert.match(res.body.error, /too many/i);
       assert.ok(res.headers["retry-after"]);
     });
+
+    it("handler accepts JSON passed as a raw string or Buffer and parses it", async () => {
+      const stringReq = {
+        method: "POST",
+        body: JSON.stringify({ emails: ["test@example.com"] }),
+        headers: { "content-type": "application/json" },
+      };
+      const stringRes = createMockRes();
+      await handler(stringReq, stringRes);
+      assert.equal(stringRes.statusCode, 200);
+
+      const bufferReq = {
+        method: "POST",
+        body: Buffer.from(JSON.stringify({ emails: ["test@example.com"] })),
+        headers: { "content-type": "application/json" },
+      };
+      const bufferRes = createMockRes();
+      await handler(bufferReq, bufferRes);
+      assert.equal(bufferRes.statusCode, 200);
+    });
+
+    it("handler returns HTTP 400 for malformed JSON string bodies", async () => {
+      const req = {
+        method: "POST",
+        body: "invalid-json-string{",
+        headers: { "content-type": "application/json" },
+      };
+      const res = createMockRes();
+      await handler(req, res);
+      assert.equal(res.statusCode, 400);
+      assert.match(res.body.error, /invalid json/i);
+    });
   });
 
   // 12 — Extended SSRF: BlockList IPv4/IPv6 ranges & IPv4-in-IPv6 extraction
