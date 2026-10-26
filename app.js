@@ -226,8 +226,8 @@ function upsertChunkResults(results, counts) {
   for (let i = 0; i < results.length; i++) {
     const result = results[i];
     const lowerEmail = result.email.toLowerCase();
-    const count = counts.get(lowerEmail) || 1;
-    const fullResult = { ...result, count };
+    const count = counts.get(lowerEmail) || result.count || result.occurrences || 1;
+    const fullResult = { ...result, count, occurrences: count };
 
     // Update or insert into allResults
     const existingIdx = allResults.findIndex(r => r.email.toLowerCase() === lowerEmail);
@@ -550,7 +550,7 @@ function updatePigeonholeCounts(counts) {
   const totals = { all: 0, likely_deliverable: 0, likely_bounce: 0, unknown: 0 };
 
   for (const result of allResults) {
-    const c = result.count || 1;
+    const c = result.count || result.occurrences || 1;
     totals[result.status] = (totals[result.status] || 0) + c;
     totals.all += c;
   }
@@ -712,7 +712,7 @@ function handleExportCSV() {
       csvSanitize(r.checks?.syntax || 'not_checked'),
       csvSanitize(r.checks?.mx || 'not_checked'),
       csvSanitize(r.checks?.recipient || 'not_checked'),
-      csvSanitize(r.count || 1),
+      csvSanitize(r.count || r.occurrences || 1),
     ].join(',');
   });
 
@@ -746,7 +746,8 @@ async function handleCopyResults() {
   if (allResults.length === 0) return;
 
   const text = allResults.map(r => {
-    const occurrences = (r.count && r.count > 1) ? ` (×${r.count})` : '';
+    const occ = r.count || r.occurrences || 1;
+    const occurrences = occ > 1 ? ` (×${occ})` : '';
     return `${r.email}${occurrences}\t${r.status}\t${r.reason}`;
   }).join('\n');
 

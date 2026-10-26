@@ -67,9 +67,9 @@ The visual style uses an uncoated paper background, two-colour riso-style ink, t
 ```
 Browser (index.html + styles.css + app.js)
   │
-  │ POST /api/verify (up to 100 unique addresses per chunk)
+  │ POST /api/verify (up to 100 unique addresses per chunk, 15000ms client timeout)
   ▼
-Vercel Node.js Function: api/verify.js
+Vercel Node.js Function: api/verify.js (maxDuration: 15s)
   ├─ enforces IP rate limit (60 req / 60s, configurable via RATE_LIMIT_MAX)
   ├─ validates request types, string lengths (<2048 chars), and batch limit (max 100)
   ├─ case-insensitively deduplicates emails
@@ -77,7 +77,7 @@ Vercel Node.js Function: api/verify.js
   ├─ Stage 2: queries domain MX records (parallel 2500ms A/AAAA fallback, RFC 7505 Null MX)
   ├─ Stage 3: bounded-concurrency recipient verification (max 10 concurrent checks):
   │    ├─ Tier 1. External HTTPS Verification API (Authorization header, 4000ms timeout)
-  │    ├─ Tier 2. Direct SMTP Socket Probe on Port 25 (if enabled, with SSRF block & catch-all cache)
+  │    ├─ Tier 2. Direct SMTP Socket Probe on Port 25 (if enabled, 2500ms timeout, with SSRF block & catch-all cache)
   │    └─ Default. Honest unknown fallback (Port 25 blocked in serverless)
   ├─ applies conservative classification rules
   └─ returns structured JSON; no email message is ever sent
@@ -232,7 +232,7 @@ Run the automated test suite:
 npm test
 ```
 
-The test suite uses Node's built-in `node:test` runner and executes 37 automated tests across 12 suites with zero external network dependencies:
+The test suite uses Node's built-in `node:test` runner and executes 39 automated tests across 12 suites with zero external network dependencies:
 - Syntax validation & RFC 5321 length limits (>254 chars, >64 local)
 - Internationalized email (IDN punycode & UTF-8 local part)
 - Domain mail routing & RFC 7505 Null MX detection
