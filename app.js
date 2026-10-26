@@ -5,7 +5,7 @@
 
 // --- Constants ---
 const MAX_ADDRESSES = 1000;
-const CHUNK_SIZE = 100;
+const CHUNK_SIZE = 50;
 const ANIMATE_FIRST_N = 30;
 const STAGGER_MS = 15;
 const API_URL = '/api/verify';
@@ -155,24 +155,46 @@ function emailHash(email) {
   return hash;
 }
 
-function stampRotation(email) {
+/**
+ * Return a CSS class name for stamp rotation based on email hash.
+ * Maps to one of 17 classes: stamp-rot-n40, stamp-rot-n35, ..., stamp-rot-0, ..., stamp-rot-p40.
+ */
+function stampRotationClass(email) {
   const h = emailHash(email);
-  return ((((h % 81) + 81) % 81) - 40) / 10;
+  // Map to 0–16 (17 steps: -4, -3.5, ..., 0, ..., +4 in 0.5deg steps)
+  const idx = ((h % 17) + 17) % 17;
+  const steps = ['n40','n35','n30','n25','n20','n15','n10','n05','0','p05','p10','p15','p20','p25','p30','p35','p40'];
+  return `stamp-rot-${steps[idx]}`;
 }
 
 /**
- * Deduplicate addresses case-insensitively, returning { unique: string[], counts: Map<string, number> }
+ * Normalize an email address: trim, preserve local-part case, lowercase domain only.
+ */
+function normalizeEmailAddress(raw) {
+  if (typeof raw !== 'string') return String(raw);
+  const trimmed = raw.trim();
+  const atIdx = trimmed.lastIndexOf('@');
+  if (atIdx === -1) return trimmed;
+  const localPart = trimmed.slice(0, atIdx);
+  const domainPart = trimmed.slice(atIdx + 1).toLowerCase();
+  return `${localPart}@${domainPart}`;
+}
+
+/**
+ * Deduplicate addresses. Uses normalizeEmailAddress for case-insensitive domain,
+ * preserving original local-part case. Two addresses with same normalized form are duplicates.
  */
 function deduplicateAddresses(lines) {
   const counts = new Map();
   const unique = [];
   for (const line of lines) {
-    const lower = line.toLowerCase();
+    const normalized = normalizeEmailAddress(line);
+    const lower = normalized.toLowerCase();
     if (counts.has(lower)) {
       counts.set(lower, counts.get(lower) + 1);
     } else {
       counts.set(lower, 1);
-      unique.push(line);
+      unique.push(normalized);
     }
   }
   return { unique, counts };
@@ -225,12 +247,13 @@ function checkClientSyntax(email) {
 function upsertChunkResults(results, counts) {
   for (let i = 0; i < results.length; i++) {
     const result = results[i];
-    const lowerEmail = result.email.toLowerCase();
+    const normalized = normalizeEmailAddress(result.email);
+    const lowerEmail = normalized.toLowerCase();
     const count = counts.get(lowerEmail) || result.count || result.occurrences || 1;
-    const fullResult = { ...result, count, occurrences: count };
+    const fullResult = { ...result, email: normalized, count, occurrences: count };
 
     // Update or insert into allResults
-    const existingIdx = allResults.findIndex(r => r.email.toLowerCase() === lowerEmail);
+    const existingIdx = allResults.findIndex(r => normalizeEmailAddress(r.email).toLowerCase() === lowerEmail);
     if (existingIdx !== -1) {
       allResults[existingIdx] = fullResult;
     } else {
@@ -238,17 +261,15 @@ function upsertChunkResults(results, counts) {
     }
 
     // Update or insert into DOM
-    const existingRow = $ledgerBody.querySelector(`tr[data-email="${CSS.escape(result.email)}"]`);
+    const existingRow = $ledgerBody.querySelector(`tr[data-email="${CSS.escape(normalized)}"]`);
     const newRow = createResultRow(fullResult, 1, count);
 
-    // Stagger animation for initial items
+    // Stagger animation for initial items using CSS classes (no inline style)
     if (i < ANIMATE_FIRST_N) {
       const stamp = newRow.querySelector('.stamp');
       if (stamp) {
         stamp.classList.add('stamp-animate');
-        stamp.style.animationDelay = `${i * STAGGER_MS}ms`;
-        const rotation = stampRotation(result.email);
-        stamp.style.setProperty('--stamp-rotation', `${rotation}deg`);
+        stamp.classList.add(`stagger-${i}`);
       }
     }
 
@@ -280,13 +301,14 @@ async function handleVerify(isRetry = false) {
     activeFilter = 'all';
 
     // Collapse intake slip and move keyboard focus to Edit list
-    $intakeSlip.style.display = 'none';
+    $intakeSlip.classList.add('hidden-slip');
     $intakeCollapsed.classList.add('visible');
     $intakeSummary.textContent = `${lines.length.toLocaleString()} address${lines.length !== 1 ? 'es' : ''} submitted`;
     $editListBtn.focus();
 
     // Show results area
-    $resultsDivider.style.display = '';
+    $resultsDivider.hidden = false;
+    $resultsDivider.classList.add('visible');
     $pigeonholes.classList.add('visible');
     $ledgerWrap.classList.add('visible');
     $progressStrip.hidden = false;
@@ -344,7 +366,7 @@ async function handleVerify(isRetry = false) {
 
       const controller = new AbortController();
       activeAbortController = controller;
-      const timeoutId = setTimeout(() => controller.abort(), CLIENT_TIMEOUT_MS);
+      const timeoutId = setTimeout(() => controller.abort(new Error('timeout')), CLIENT_TIMEOUT_MS);
 
       try {
         const response = await fetch(API_URL, {
@@ -406,13 +428,13 @@ async function handleVerify(isRetry = false) {
         $errorBanner.hidden = false;
         $errorBanner.classList.add('visible');
         $errorMessage.textContent = `The request failed. Nothing was sent to any address. (${failureReason})`;
-        $progressStrip.textContent = 'Sorting failed — see notice above';
+        $progressStrip.textContent = 'Sorting failed — see error notice above';
       } else if (lastFailedChunks.length > 0) {
         // Partial failure
         $errorBanner.hidden = false;
         $errorBanner.classList.add('visible');
-        $errorMessage.textContent = `Some address batches could not be checked. (${failureReason})`;
-        $progressStrip.textContent = 'Sorting finished with errors — some addresses could not be checked';
+        $errorMessage.textContent = `Some batches could not be checked. Completed results are shown below — use Try again to retry failed addresses. (${failureReason})`;
+        $progressStrip.textContent = 'Sorting partially complete — some batches failed';
       } else {
         // Full success
         $errorBanner.hidden = true;
@@ -487,11 +509,10 @@ function createResultRow(result, rowNum, count) {
 
 function createStamp(status, email) {
   const info = STATUS_LABELS[status] || STATUS_LABELS.unknown;
-  const rotation = stampRotation(email);
+  const rotClass = stampRotationClass(email);
 
   const stamp = document.createElement('div');
-  stamp.className = `stamp ${info.cssClass}`;
-  stamp.style.transform = `rotate(${rotation}deg)`;
+  stamp.className = `stamp ${info.cssClass} ${rotClass}`;
 
   const primary = document.createElement('span');
   primary.className = 'stamp-primary';
@@ -578,10 +599,10 @@ function applyFilter() {
 
   rows.forEach(row => {
     if (activeFilter === 'all' || row.dataset.status === activeFilter) {
-      row.style.display = '';
+      row.classList.remove('row-hidden');
       visibleCount++;
     } else {
-      row.style.display = 'none';
+      row.classList.add('row-hidden');
     }
   });
 
@@ -600,7 +621,7 @@ function applyFilter() {
 
   let num = 0;
   rows.forEach(row => {
-    if (row.style.display !== 'none') {
+    if (!row.classList.contains('row-hidden')) {
       num++;
       const numCell = row.querySelector('.col-num');
       if (numCell) numCell.textContent = num;
@@ -658,7 +679,7 @@ function handleClear() {
 
   updateCounter();
 
-  $intakeSlip.style.display = '';
+  $intakeSlip.classList.remove('hidden-slip');
   $intakeCollapsed.classList.remove('visible');
   $pigeonholes.classList.remove('visible');
   $progressStrip.hidden = true;
@@ -667,7 +688,8 @@ function handleClear() {
   $errorBanner.classList.remove('visible');
   $exportButtons.classList.remove('visible');
   $ledgerWrap.classList.remove('visible');
-  $resultsDivider.style.display = 'none';
+  $resultsDivider.hidden = true;
+  $resultsDivider.classList.remove('visible');
   $ledgerBody.innerHTML = '';
 
   document.querySelectorAll('.pigeonhole').forEach(btn => {
@@ -694,7 +716,7 @@ function handleEditList() {
     handleCancel();
   }
 
-  $intakeSlip.style.display = '';
+  $intakeSlip.classList.remove('hidden-slip');
   $intakeCollapsed.classList.remove('visible');
   $textarea.focus();
 }
@@ -760,19 +782,21 @@ async function handleCopyResults() {
     // Fallback using textarea + execCommand
     const ta = document.createElement('textarea');
     ta.value = text;
-    ta.style.position = 'fixed';
-    ta.style.opacity = '0';
+    ta.setAttribute('readonly', '');
+    ta.className = 'sr-only';
     document.body.appendChild(ta);
     ta.select();
-    const successful = document.execCommand('copy');
+    let ok = false;
+    try { ok = document.execCommand('copy'); } catch { ok = false; }
     document.body.removeChild(ta);
 
-    if (successful) {
+    if (ok) {
+      const originalText = $copyBtn.textContent;
       $copyBtn.textContent = 'Copied!';
-      setTimeout(() => { $copyBtn.textContent = 'Copy results'; }, 2000);
+      setTimeout(() => { $copyBtn.textContent = originalText; }, 2000);
     } else {
-      $copyBtn.textContent = 'Copy failed';
-      setTimeout(() => { $copyBtn.textContent = 'Copy results'; }, 2000);
+      $copyBtn.textContent = 'Copy failed — use CSV export';
+      setTimeout(() => { $copyBtn.textContent = 'Copy results'; }, 2500);
     }
   }
 }

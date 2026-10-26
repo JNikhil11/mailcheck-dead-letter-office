@@ -13,7 +13,7 @@
   <!-- ============================================================
        HIDDEN SVG FILTERS
        ============================================================ -->
-  <svg xmlns="http://www.w3.org/2000/svg" width="0" height="0" style="position:absolute" aria-hidden="true">
+  <svg xmlns="http://www.w3.org/2000/svg" width="0" height="0" class="svg-defs" aria-hidden="true">
     <defs>
       <!-- Paper grain texture filter -->
       <filter id="paper-grain" x="0%" y="0%" width="100%" height="100%">
@@ -96,7 +96,7 @@
       <button class="edit-list-btn" id="edit-list-btn" type="button">Edit list</button>
     </div>
 
-    <hr class="section-divider" id="results-divider" style="display:none">
+    <hr class="section-divider" id="results-divider" hidden>
 
     <!-- ============================================================
          PIGEONHOLES (Summary & Filter Cubbies)
@@ -172,7 +172,7 @@
          ============================================================ -->
     <footer class="footnote" id="footnote">
       <p>A postmark proves a letter was posted, not that anyone lives at the address. MX records show that a domain can receive mail, not that a particular mailbox exists. Results are predictions, not guarantees.</p>
-      <p>MailCheck does not intentionally store submitted address lists in a database or browser storage, and no email messages are sent. If an optional external verification provider is configured, submitted addresses are checked via that provider.</p>
+      <p>Addresses are checked in memory and not stored in any database or browser storage, and no emails are sent. Standard platform request logs may apply, and if an optional external verification API is configured, addresses are sent to that provider under its privacy policy.</p>
       <div class="footnote-controls">
         <button class="plain-view-btn" id="plain-view-btn" type="button" aria-pressed="false" data-texture="off">Plain view</button>
       </div>

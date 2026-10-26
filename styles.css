@@ -215,11 +215,23 @@ body {
   line-height: 1;
 }
 
-/* --- Section Divider --- */
+/* --- SVG Defs (hidden, position absolute) --- */
+.svg-defs {
+  position: absolute;
+  width: 0;
+  height: 0;
+}
+
+/* --- Results Divider --- */
 .section-divider {
   border: none;
   border-top: var(--border-dashed);
   margin: 2rem 0;
+  display: none;
+}
+
+.section-divider.visible {
+  display: block;
 }
 
 /* ============================================================
@@ -1051,4 +1063,74 @@ body {
 [data-texture="off"] .masthead-title::before,
 [data-texture="off"] .masthead-title::after {
   display: none;
+}
+
+/* ============================================================
+   STAMP ROTATION CLASSES (replaces inline style transform)
+   Steps: -4.0deg to +4.0deg in 0.5deg increments
+   Class names: stamp-rot-n40 through stamp-rot-p40 (×10 scale)
+   ============================================================ */
+.stamp-rot-n40 { transform: rotate(-4.0deg); }
+.stamp-rot-n35 { transform: rotate(-3.5deg); }
+.stamp-rot-n30 { transform: rotate(-3.0deg); }
+.stamp-rot-n25 { transform: rotate(-2.5deg); }
+.stamp-rot-n20 { transform: rotate(-2.0deg); }
+.stamp-rot-n15 { transform: rotate(-1.5deg); }
+.stamp-rot-n10 { transform: rotate(-1.0deg); }
+.stamp-rot-n05 { transform: rotate(-0.5deg); }
+.stamp-rot-0   { transform: rotate(0deg); }
+.stamp-rot-p05 { transform: rotate(0.5deg); }
+.stamp-rot-p10 { transform: rotate(1.0deg); }
+.stamp-rot-p15 { transform: rotate(1.5deg); }
+.stamp-rot-p20 { transform: rotate(2.0deg); }
+.stamp-rot-p25 { transform: rotate(2.5deg); }
+.stamp-rot-p30 { transform: rotate(3.0deg); }
+.stamp-rot-p35 { transform: rotate(3.5deg); }
+.stamp-rot-p40 { transform: rotate(4.0deg); }
+
+/* ============================================================
+   STAMP ANIMATION STAGGER CLASSES (replaces inline animationDelay)
+   .stagger-0 through .stagger-29 (30 steps × 15ms = 0ms–435ms)
+   ============================================================ */
+.stagger-0  { animation-delay: 0ms; }
+.stagger-1  { animation-delay: 15ms; }
+.stagger-2  { animation-delay: 30ms; }
+.stagger-3  { animation-delay: 45ms; }
+.stagger-4  { animation-delay: 60ms; }
+.stagger-5  { animation-delay: 75ms; }
+.stagger-6  { animation-delay: 90ms; }
+.stagger-7  { animation-delay: 105ms; }
+.stagger-8  { animation-delay: 120ms; }
+.stagger-9  { animation-delay: 135ms; }
+.stagger-10 { animation-delay: 150ms; }
+.stagger-11 { animation-delay: 165ms; }
+.stagger-12 { animation-delay: 180ms; }
+.stagger-13 { animation-delay: 195ms; }
+.stagger-14 { animation-delay: 210ms; }
+.stagger-15 { animation-delay: 225ms; }
+.stagger-16 { animation-delay: 240ms; }
+.stagger-17 { animation-delay: 255ms; }
+.stagger-18 { animation-delay: 270ms; }
+.stagger-19 { animation-delay: 285ms; }
+.stagger-20 { animation-delay: 300ms; }
+.stagger-21 { animation-delay: 315ms; }
+.stagger-22 { animation-delay: 330ms; }
+.stagger-23 { animation-delay: 345ms; }
+.stagger-24 { animation-delay: 360ms; }
+.stagger-25 { animation-delay: 375ms; }
+.stagger-26 { animation-delay: 390ms; }
+.stagger-27 { animation-delay: 405ms; }
+.stagger-28 { animation-delay: 420ms; }
+.stagger-29 { animation-delay: 435ms; }
+
+/* ============================================================
+   INTAKE SLIP HIDDEN STATE (replaces inline display:none/block)
+   ============================================================ */
+.intake-slip.hidden-slip {
+  display: none;
+}
+
+/* Row filter visibility */
+.row-hidden {
+  display: none !important;
 }

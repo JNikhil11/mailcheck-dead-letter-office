@@ -13,17 +13,17 @@ MailCheck accepts up to 1,000 email addresses and returns **Likely Deliverable**
 - **Bulk verification** — paste up to 1,000 addresses, one per line
 - **Three honest statuses** — Likely Deliverable, Likely Bounce, and Unknown (a valid outcome, not an error)
 - **Syntax validation & RFC limits** — enforces RFC 5321 length limits (254 total, 64 local part) and internationalized domain/punycode support (IDN/EAI)
-- **DNS/MX lookup** — queries domain mail routing with parallel 2500ms A/AAAA fallback and RFC 7505 Null MX detection
-- **SSRF Protection** — blocks connections to loopback (`127.0.0.0/8`, `::1`), private (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `fc00::/7`), link-local, multicast, and IPv4-mapped private IPv6
-- **Multi-MX Fallback** — stores full priority-sorted MX exchanges and attempts secondary MX hosts if the primary host is unreachable
+- **DNS/MX lookup** — queries domain mail routing with parallel 2000ms A/AAAA fallback, DNS concurrency of 25, 11000ms batch time budget, and RFC 7505 Null MX detection
+- **SSRF Protection** — uses Node.js `net.BlockList` plus IPv4-in-IPv6 extraction to block connections to loopback (`127.0.0.0/8`, `::1`), private (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `fc00::/7`), link-local, multicast, NAT64, 6to4, and IPv4-mapped/compatible private IPv6
+- **Multi-MX Fallback** — stores full priority-sorted MX exchanges and attempts up to the top 2 highest-priority MX hosts if the primary host is unreachable
 - **Narrow 5xx Classification** — strictly narrows SMTP `rejected` verdicts to explicit 550/551/553 mailbox nonexistent responses, classifying policy/reputation/spam blocks (`554`, `5.7.1`) as `unknown`
-- **Application-Level IP Rate Limiting** — sliding-window rate limiter (60 batch requests per 60s per client IP, configurable via `RATE_LIMIT_MAX`) returning HTTP 429 with `Retry-After: 60`
-- **Duplicate collapsing** — identical addresses (case-insensitively deduplicated) show as one row with a `× N` badge; counts still sum correctly
-- **Progressive results & Cancel control** — large batches send in chunks of 100 with interactive cancellation and retry for failed chunks
+- **Application-Level IP Rate Limiting** — sliding-window rate limiter (60 batch requests per 60s per client IP, in-memory per serverless instance, configurable via `RATE_LIMIT_MAX`) returning HTTP 429 with `Retry-After: 60`
+- **Duplicate collapsing** — deduplicates domain case-insensitively while preserving original local-part casing per RFC 5321; identical addresses show as one row with a `× N` badge; counts still sum correctly
+- **Progressive results & Cancel control** — large batches send in chunks of 50 unique addresses (API max 100) with interactive cancellation and retry for failed chunks
 - **OWASP CSV sanitization & clipboard copy** — prefixes formulas (`=`, `+`, `-`, `@`, `\t`, `\r` after optional whitespace) with `'` to prevent spreadsheet injection; exports exact 7 columns (`email,status,reason,syntax,mx,recipient,occurrences`) and copies formatted results with occurrence counts
 - **Accessible & High-Contrast** — WCAG contrast compliant red text (`#B3290C`), semantic table, `aria-sort`, `aria-pressed`, `aria-live` progress, and visible focus rings
 - **Reduced motion & Plain view toggle** — respects `prefers-reduced-motion` and allows disabling decorative SVG filters
-- **Privacy-first** — addresses are processed in memory and discarded; nothing is stored and no emails are sent
+- **Privacy-first** — Addresses are checked in memory and not stored in any database or browser storage, and no emails are sent. Standard platform request logs may apply, and if an optional external verification API is configured, addresses are sent to that provider under its privacy policy.
 
 ---
 
@@ -67,17 +67,17 @@ The visual style uses an uncoated paper background, two-colour riso-style ink, t
 ```
 Browser (index.html + styles.css + app.js)
   │
-  │ POST /api/verify (up to 100 unique addresses per chunk, 15000ms client timeout)
+  │ POST /api/verify (up to 50 unique addresses per chunk, 15000ms client timeout)
   ▼
-Vercel Node.js Function: api/verify.js (maxDuration: 15s)
-  ├─ enforces IP rate limit (60 req / 60s, configurable via RATE_LIMIT_MAX)
+Vercel Node.js Function: api/verify.js (maxDuration: 15s, batch budget: 11000ms)
+  ├─ enforces IP rate limit (60 req / 60s per IP, configurable via RATE_LIMIT_MAX)
   ├─ validates request types, string lengths (<2048 chars), and batch limit (max 100)
-  ├─ case-insensitively deduplicates emails
+  ├─ case-insensitively deduplicates domains while preserving local-part casing
   ├─ Stage 1: validates email syntax & RFC 5321 length limits (254 total / 64 local)
-  ├─ Stage 2: queries domain MX records (parallel 2500ms A/AAAA fallback, RFC 7505 Null MX)
+  ├─ Stage 2: queries domain MX records (parallel 2000ms A/AAAA fallback, DNS concurrency 25, RFC 7505 Null MX)
   ├─ Stage 3: bounded-concurrency recipient verification (max 10 concurrent checks):
-  │    ├─ Tier 1. External HTTPS Verification API (Authorization header, 4000ms timeout)
-  │    ├─ Tier 2. Direct SMTP Socket Probe on Port 25 (if enabled, 2500ms timeout, with SSRF block & catch-all cache)
+  │    ├─ Tier 1. Tested Emailable v1 Adapter over HTTPS (Authorization: Bearer header, 4000ms timeout)
+  │    ├─ Tier 2. Direct SMTP Socket Probe on Port 25 (if enabled, attempts up to top 2 MX hosts, 2500ms timeout)
   │    └─ Default. Honest unknown fallback (Port 25 blocked in serverless)
   ├─ applies conservative classification rules
   └─ returns structured JSON; no email message is ever sent
@@ -93,13 +93,13 @@ Browser renders stamps, postmarks, and counts progressively
 ### Serverless Hosting (Vercel)
 In serverless environments like Vercel, outbound TCP Port 25 is blocked by network infrastructure:
 - Direct SMTP probing is disabled by default to avoid hanging connections.
-- **Optional HTTPS Verification API (Port 443)**: If `EMAIL_VERIFICATION_API_KEY` is configured (supporting Emailable, Hunter, or AbstractAPI), MailCheck routes recipient verification over HTTPS with Bearer authorization and a 4000ms timeout.
+- **Tested Emailable v1 Adapter (Port 443)**: If `EMAIL_VERIFICATION_API_KEY` is configured, MailCheck routes recipient verification over HTTPS using the tested Emailable v1 integration with Bearer authorization and a 4000ms timeout.
 - Otherwise, valid-syntax and MX-verified addresses honestly return `checks.recipient: "not_checked"`, `status: "unknown"`, and reason `"Domain accepts mail, but the mailbox was not confirmed"`.
 
 ### Local Development / Servers with Port 25 Outbound
 When running in an environment where outbound Port 25 is permitted and `ENABLE_SMTP_PROBE=true`:
-1. **SSRF Verification**: MailCheck resolves the MX exchange and ensures it does not point to loopback, private, link-local, or reserved IP space.
-2. Connects to the highest-priority MX host on port 25 with a strict 2500ms socket timeout.
+1. **SSRF Verification**: MailCheck resolves the MX exchange and verifies it via `net.BlockList` and IPv4-in-IPv6 parsing, ensuring it does not point to loopback, private, link-local, or reserved IP space.
+2. Connects to the highest-priority MX host on port 25 with a strict 2500ms socket timeout, attempting up to the top 2 highest-priority MX hosts if connection fails.
 3. Performs greeting (`220`), `EHLO` with configurable `SMTP_HELO_DOMAIN`, and `MAIL FROM:<${SMTP_MAIL_FROM}>`.
 4. **Catch-All Detection**: Sends a randomized non-existent mailbox probe (`RCPT TO:<nonexistent-probe-...>`) and caches results per domain across the batch:
    - If the server accepts the random probe (`250`/`251`), the domain is classified as catch-all $\rightarrow$ `recipient: "inconclusive"`, `status: "unknown"`.
@@ -115,7 +115,7 @@ When running in an environment where outbound Port 25 is permitted and `ENABLE_S
 ## Local Setup
 
 ### Prerequisites
-- **Node.js 18+** (Node 20 or 22 recommended)
+- **Node.js 20+** (Node 20 or 22 recommended)
 
 ### Install and run
 
@@ -220,7 +220,7 @@ npm test
 
 ## Privacy Notice
 
-MailCheck does not intentionally store submitted address lists in a database or browser storage, and no email messages are sent. If an optional external verification provider is configured, submitted addresses are checked via that provider.
+Addresses are checked in memory and not stored in any database or browser storage, and no emails are sent. Standard platform request logs may apply, and if an optional external verification API is configured, addresses are sent to that provider under its privacy policy.
 
 ---
 
@@ -232,17 +232,24 @@ Run the automated test suite:
 npm test
 ```
 
-The test suite uses Node's built-in `node:test` runner and executes 39 automated tests across 12 suites with zero external network dependencies:
-- Syntax validation & RFC 5321 length limits (>254 chars, >64 local)
-- Internationalized email (IDN punycode & UTF-8 local part)
-- Domain mail routing & RFC 7505 Null MX detection
-- RFC 5321 parallel A / AAAA fallback with timeout protection
-- SSRF protection & private/loopback/link-local/multicast IP blocking
-- SMTP probing, catch-all detection, and narrow 5xx classification
-- External HTTPS verification API with Bearer authorization
-- Case-insensitive deduplication and batch size enforcement
-- In-memory sliding-window IP rate limiting
-- Security input validation (XSS payloads, non-string items, HTTP method guards)
+The test suite uses Node's built-in `node:test` runner and executes 62 automated tests across 17 suites with zero external network dependencies:
+- **1 — Syntax validation & RFC 5321 length limits** (>254 chars total, >64 local part)
+- **2 — Internationalized email (EAI / IDN)** (IDN punycode & UTF-8 local part)
+- **3 — Domain mail routing & RFC 7505 Null MX detection**
+- **4 — RFC 5321 parallel A / AAAA fallback** on ENODATA with timeout protection
+- **5 — SSRF protection & private IP blocking** (loopback, RFC 1918, link-local, multicast, reserved)
+- **6 — SMTP probing & narrow 5xx classification** (catch-all detection, explicit user-unknown vs spam/policy)
+- **7 — External HTTPS verification API** with Bearer authorization and network fallback
+- **8 — Dependency injection in classifyEmail** (unit test isolation without global mutable state)
+- **9 — Batch size limit & case-insensitive deduplication** (max 100 batch limit)
+- **10 — In-memory sliding-window IP rate limiter** (60 requests / 60s per client IP)
+- **11 — Security & input validation** (XSS payloads, non-string items, HTTP method guards, HTTP 429)
+- **12 — Extended SSRF BlockList & IPv4-in-IPv6** (`net.BlockList`, IPv4-mapped, IPv4-compatible, NAT64, 6to4, deprecated site-local, documentation ranges)
+- **13 — Distinct DNS error reason strings** (ETIMEOUT vs ESERVFAIL / ECONNREFUSED)
+- **14 — Batch time budget enforcement** (11000ms hard deadline prevents serverless 504 timeouts)
+- **15 — normalizeEmailAddress local-part case preservation** (preserves local case, lowercases domain)
+- **16 — IP header trust order for rate limiting** (`x-vercel-forwarded-for` > `x-real-ip` > socket > last hop `x-forwarded-for`)
+- **17 — Comprehensive end-to-end integration verification**
 
 ---
 

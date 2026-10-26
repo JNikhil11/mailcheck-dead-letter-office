@@ -13,11 +13,12 @@ export const MAX_BATCH = 100;
 export const MAX_EMAIL_LENGTH = 2048;
 export const RFC_MAX_EMAIL_LENGTH = 254;
 export const RFC_MAX_LOCAL_LENGTH = 64;
-export const DNS_TIMEOUT_MS = 2500;
+export const DNS_TIMEOUT_MS = 2000;
 export const API_TIMEOUT_MS = 4000;
 export const SMTP_TIMEOUT_MS = 2500;
 export const STAGE3_CONCURRENCY = 10;
-export const DNS_CONCURRENCY = 10;
+export const DNS_CONCURRENCY = 25;
+export const BATCH_TIME_BUDGET_MS = 11000;
 
 // Rate limiting: 60 requests per 60 seconds per IP (configurable via RATE_LIMIT_MAX)
 export const RATE_LIMIT_WINDOW_MS = 60000;
@@ -83,51 +84,183 @@ export function checkRateLimit(ip, maxRequests = RATE_LIMIT_MAX_REQUESTS, window
 }
 
 // ---------------------------------------------------------------------------
-// SSRF & Private / Reserved IP Protection
+// SSRF & Private / Reserved IP Protection (using net.BlockList)
 // ---------------------------------------------------------------------------
+
+const _ipv4BlockList = new net.BlockList();
+const _ipv6BlockList = new net.BlockList();
+
+// All special-use IPv4 ranges per IANA
+for (const [addr, prefix] of [
+  ['0.0.0.0', 8],
+  ['10.0.0.0', 8],
+  ['100.64.0.0', 10],
+  ['127.0.0.0', 8],
+  ['169.254.0.0', 16],
+  ['172.16.0.0', 12],
+  ['192.0.0.0', 24],
+  ['192.0.2.0', 24],
+  ['192.88.99.0', 24],
+  ['192.168.0.0', 16],
+  ['198.18.0.0', 15],
+  ['198.51.100.0', 24],
+  ['203.0.113.0', 24],
+  ['224.0.0.0', 4],
+  ['240.0.0.0', 4],
+  ['255.255.255.255', 32],
+]) {
+  _ipv4BlockList.addSubnet(addr, prefix, 'ipv4');
+}
+
+// All special-use IPv6 ranges per IANA
+for (const [addr, prefix] of [
+  ['::', 128],
+  ['::1', 128],
+  ['::ffff:0:0', 96],
+  ['64:ff9b::', 96],
+  ['64:ff9b:1::', 48],
+  ['100::', 64],
+  ['2001::', 32],
+  ['2001:2::', 48],
+  ['2001:db8::', 32],
+  ['2002::', 16],
+  ['fc00::', 7],
+  ['fe80::', 10],
+  ['fec0::', 10],
+  ['ff00::', 8],
+]) {
+  _ipv6BlockList.addSubnet(addr, prefix, 'ipv6');
+}
+
+/**
+ * Parse an IPv6 address string into an array of 8 unsigned 16-bit words (big-endian).
+ * Handles :: expansion and dotted-quad IPv4 tails.
+ * Returns null if unparseable.
+ * @param {string} s
+ * @returns {number[]|null}
+ */
+function parseIPv6Words(s) {
+  s = s.trim().toLowerCase();
+  // Remove surrounding brackets if any
+  if (s.startsWith('[') && s.endsWith(']')) s = s.slice(1, -1);
+
+  let left = s, right = '';
+  const dcIdx = s.indexOf('::');
+  if (dcIdx !== -1) {
+    left = s.slice(0, dcIdx);
+    right = s.slice(dcIdx + 2);
+  }
+
+  function parseGroups(part) {
+    if (!part) return [];
+    // Handle IPv4 tail in last group
+    const groups = part.split(':');
+    const result = [];
+    for (let i = 0; i < groups.length; i++) {
+      const g = groups[i];
+      if (g.includes('.')) {
+        // Dotted-quad IPv4
+        const octets = g.split('.').map(Number);
+        if (octets.length !== 4 || octets.some(o => isNaN(o) || o < 0 || o > 255)) return null;
+        result.push((octets[0] << 8) | octets[1]);
+        result.push((octets[2] << 8) | octets[3]);
+      } else {
+        const v = parseInt(g, 16);
+        if (isNaN(v) || v < 0 || v > 0xffff) return null;
+        result.push(v);
+      }
+    }
+    return result;
+  }
+
+  const leftWords = parseGroups(left);
+  if (leftWords === null) return null;
+  const rightWords = parseGroups(right);
+  if (rightWords === null) return null;
+
+  const missing = 8 - leftWords.length - rightWords.length;
+  if (missing < 0) return null;
+  return [...leftWords, ...Array(missing).fill(0), ...rightWords];
+}
+
+/**
+ * If an IPv6 address encodes an IPv4 address (IPv4-mapped, IPv4-compatible, NAT64, 6to4),
+ * extract and return that IPv4 string. Otherwise returns null.
+ * @param {string} s — lowercase IPv6 string
+ * @returns {string|null}
+ */
+function extractIPv4FromIPv6(s) {
+  const words = parseIPv6Words(s);
+  if (!words || words.length !== 8) return null;
+
+  // IPv4-mapped: ::ffff:a.b.c.d  → words 0-4 are 0, word 5 is 0xffff
+  // IPv4-compatible: ::a.b.c.d  → words 0-5 are 0 (word 5 is 0x0000)
+  const allZeroExceptLast2 = words[0] === 0 && words[1] === 0 && words[2] === 0 && words[3] === 0 && words[4] === 0;
+  if (allZeroExceptLast2 && (words[5] === 0xffff || words[5] === 0x0000)) {
+    const a = (words[6] >> 8) & 0xff;
+    const b = words[6] & 0xff;
+    const c = (words[7] >> 8) & 0xff;
+    const d = words[7] & 0xff;
+    return `${a}.${b}.${c}.${d}`;
+  }
+
+  // 6to4: 2002:ab:cd::/48 → IPv4 = words[1..2] = ab.cd (two 16-bit octets pair)
+  if (words[0] === 0x2002) {
+    const a = (words[1] >> 8) & 0xff;
+    const b = words[1] & 0xff;
+    const c = (words[2] >> 8) & 0xff;
+    const d = words[2] & 0xff;
+    return `${a}.${b}.${c}.${d}`;
+  }
+
+  // NAT64: 64:ff9b::/96 → IPv4 in words 6-7
+  if (words[0] === 0x0064 && words[1] === 0xff9b && words[2] === 0 && words[3] === 0 && words[4] === 0 && words[5] === 0) {
+    const a = (words[6] >> 8) & 0xff;
+    const b = words[6] & 0xff;
+    const c = (words[7] >> 8) & 0xff;
+    const d = words[7] & 0xff;
+    return `${a}.${b}.${c}.${d}`;
+  }
+
+  return null;
+}
 
 /**
  * Check if an IP address is private, loopback, link-local, multicast, or reserved.
+ * Uses Node's built-in net.BlockList for CIDR matching plus IPv4-in-IPv6 extraction.
  * @param {string} ip
  * @returns {boolean}
  */
 export function isPrivateOrReservedIP(ip) {
-  if (!ip || typeof ip !== "string") return true;
+  if (!ip || typeof ip !== 'string') return true;
   const s = ip.trim().toLowerCase();
-  if (s === "localhost" || s === "0.0.0.0") return true;
-
-  // Handle IPv4-mapped IPv6 like ::ffff:127.0.0.1
-  if (s.startsWith("::ffff:")) {
-    const ipv4Part = s.slice(7);
-    if (net.isIPv4(ipv4Part)) return isPrivateOrReservedIP(ipv4Part);
-  }
+  if (!s) return true;
+  if (s === 'localhost') return true;
 
   if (net.isIPv4(s)) {
-    const parts = s.split(".").map((n) => parseInt(n, 10));
-    if (parts.length !== 4 || parts.some(isNaN)) return true;
-    const [a, b] = parts;
-    if (a === 0) return true; // 0.0.0.0/8 (current network)
-    if (a === 10) return true; // 10.0.0.0/8 (private)
-    if (a === 127) return true; // 127.0.0.0/8 (loopback)
-    if (a === 169 && b === 254) return true; // 169.254.0.0/16 (link-local)
-    if (a === 172 && b >= 16 && b <= 31) return true; // 172.16.0.0/12 (private)
-    if (a === 192 && b === 168) return true; // 192.168.0.0/16 (private)
-    if (a === 100 && b >= 64 && b <= 127) return true; // 100.64.0.0/10 (carrier-grade NAT)
-    if (a >= 224) return true; // 224.0.0.0/4 multicast & 240.0.0.0/4 reserved
-    return false;
+    try {
+      return _ipv4BlockList.check(s, 'ipv4');
+    } catch {
+      return true;
+    }
   }
 
   if (net.isIPv6(s)) {
-    if (s === "::" || s === "::1") return true;
-    // fe80::/10 link-local
-    if (s.startsWith("fe8") || s.startsWith("fe9") || s.startsWith("fea") || s.startsWith("feb")) return true;
-    // fc00::/7 unique local address (ULA)
-    if (s.startsWith("fc") || s.startsWith("fd")) return true;
-    // ff00::/8 multicast
-    if (s.startsWith("ff")) return true;
-    return false;
+    // First check if it embeds a private IPv4 address
+    const embedded = extractIPv4FromIPv6(s);
+    if (embedded !== null) {
+      if (isPrivateOrReservedIP(embedded)) return true;
+    }
+
+    try {
+      // Expand for BlockList check — use canonical form
+      return _ipv6BlockList.check(s, 'ipv6');
+    } catch {
+      return true;
+    }
   }
 
+  // Unknown format — block it
   return true;
 }
 
@@ -199,6 +332,22 @@ export function checkSyntax(email) {
     rawDomain: domainPart,
     hasNonAsciiLocal,
   };
+}
+
+/**
+ * Normalize an email address: trim whitespace, preserve local-part case, lowercase domain.
+ * Alice@Example.COM -> Alice@example.com
+ * @param {string} raw
+ * @returns {string}
+ */
+export function normalizeEmailAddress(raw) {
+  if (typeof raw !== 'string') return String(raw);
+  const trimmed = raw.trim();
+  const atIdx = trimmed.lastIndexOf('@');
+  if (atIdx === -1) return trimmed;
+  const localPart = trimmed.slice(0, atIdx);
+  const domainPart = trimmed.slice(atIdx + 1).toLowerCase();
+  return `${localPart}@${domainPart}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -311,9 +460,6 @@ export async function checkMx(domain, dnsResolver = dns) {
     // Transient resolver errors / timeouts: ETIMEOUT, ESERVFAIL, EREFUSED, EAI_AGAIN, TIMEOUT
     if (
       err.code === "ETIMEOUT" ||
-      err.code === "ESERVFAIL" ||
-      err.code === "EREFUSED" ||
-      err.code === "EAI_AGAIN" ||
       err.code === "TIMEOUT" ||
       err.message === "DNS_TIMEOUT"
     ) {
@@ -323,10 +469,23 @@ export async function checkMx(domain, dnsResolver = dns) {
       };
     }
 
-    // Any other error -> treat as transient inconclusive error
+    // Non-timeout resolver errors (ESERVFAIL, EREFUSED, EAI_AGAIN, etc.)
+    if (
+      err.code === "ESERVFAIL" ||
+      err.code === "EREFUSED" ||
+      err.code === "ECONNREFUSED" ||
+      err.code === "EAI_AGAIN"
+    ) {
+      return {
+        mx: "error",
+        reason: "DNS lookup failed due to a temporary resolver error, so the result is inconclusive",
+      };
+    }
+
+    // Any other error -> treat as transient resolver error
     return {
       mx: "error",
-      reason: "The check timed out, so the result is inconclusive",
+      reason: "DNS lookup failed due to a temporary resolver error, so the result is inconclusive",
     };
   }
 }
@@ -365,8 +524,19 @@ export async function fallbackToAddressRecords(domain, dnsResolver) {
     return { mx: "none", reason: "Domain has no usable mail route" };
   }
 
-  // If neither returned addresses and at least one had a timeout or transient error:
-  return { mx: "error", reason: "The check timed out, so the result is inconclusive" };
+  // If neither returned addresses and at least one had a timeout:
+  const hasTimeout = (r) => {
+    if (r.status === 'rejected') {
+      const code = r.reason?.code;
+      return code === 'ETIMEOUT' || code === 'TIMEOUT' || r.reason?.message === 'DNS_TIMEOUT';
+    }
+    return false;
+  };
+  const eitherTimeout = hasTimeout(res4) || hasTimeout(res6);
+  if (eitherTimeout) {
+    return { mx: "error", reason: "The check timed out, so the result is inconclusive" };
+  }
+  return { mx: "error", reason: "DNS lookup failed due to a temporary resolver error, so the result is inconclusive" };
 }
 
 // ---------------------------------------------------------------------------
@@ -1087,7 +1257,13 @@ export async function verifyBatch(emails, options = {}) {
   const mxCache = new Map();
   const dnsResolver = options.dnsResolver;
 
+  const batchStartTime = Date.now();
+
   await runWithConcurrency(DNS_CONCURRENCY, validDomains, async (domain) => {
+    if (Date.now() - batchStartTime >= BATCH_TIME_BUDGET_MS) {
+      mxCache.set(domain, { mx: 'error', reason: 'Verification time budget exceeded, so the result is inconclusive' });
+      return;
+    }
     const result = await checkMx(domain, dnsResolver);
     mxCache.set(domain, result);
   });
@@ -1143,6 +1319,14 @@ export async function verifyBatch(emails, options = {}) {
 
   // Bounded concurrency Stage 3 classification (max 10 concurrent checks)
   const results = await runWithConcurrency(STAGE3_CONCURRENCY, unique, async (email) => {
+    if (Date.now() - batchStartTime >= BATCH_TIME_BUDGET_MS) {
+      return {
+        email,
+        status: 'unknown',
+        reason: 'Verification time budget exceeded, so the result is inconclusive',
+        checks: { syntax: 'pass', mx: 'error', recipient: 'not_checked' },
+      };
+    }
     return await classifyEmail(email, {
       ...options,
       dnsResolver: cachedDnsResolver,
@@ -1176,19 +1360,28 @@ export async function verifyBatch(emails, options = {}) {
  * @returns {string}
  */
 export function getClientIp(req) {
-  const xForwardedFor = req.headers && req.headers["x-forwarded-for"];
-  if (typeof xForwardedFor === "string") {
-    const first = xForwardedFor.split(",")[0].trim();
+  // Trust Vercel's platform header first (not user-spoofable)
+  const xVercelFwd = req.headers && req.headers['x-vercel-forwarded-for'];
+  if (typeof xVercelFwd === 'string') {
+    const first = xVercelFwd.split(',')[0].trim();
     if (first) return first;
   }
-  const xRealIp = req.headers && req.headers["x-real-ip"];
-  if (typeof xRealIp === "string" && xRealIp.trim()) {
+  // Trust x-real-ip if present (set by trusted reverse proxy)
+  const xRealIp = req.headers && req.headers['x-real-ip'];
+  if (typeof xRealIp === 'string' && xRealIp.trim()) {
     return xRealIp.trim();
   }
+  // Fall back to socket address
   if (req.socket && req.socket.remoteAddress) {
     return req.socket.remoteAddress;
   }
-  return "unknown";
+  // Last resort: use last hop of x-forwarded-for (not the first, to avoid spoofing)
+  const xForwardedFor = req.headers && req.headers['x-forwarded-for'];
+  if (typeof xForwardedFor === 'string') {
+    const hops = xForwardedFor.split(',').map(s => s.trim()).filter(Boolean);
+    if (hops.length > 0) return hops[hops.length - 1];
+  }
+  return 'unknown';
 }
 
 /**
