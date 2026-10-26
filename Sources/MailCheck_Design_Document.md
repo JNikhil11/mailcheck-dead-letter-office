@@ -1,10 +1,10 @@
 # MailCheck — Design Document
 
-**Version:** 1.0  
-**Status:** Initial draft — implementation-ready visual and interaction spec  
-**Date:** 25 October 2026  
+**Version:** 2.0 (Hardened Production Release)  
+**Status:** Implementation-verified visual and interaction spec  
+**Date:** 26 October 2026  
 **Product:** Bulk Email Address Verification Web Application  
-**Companion to:** MailCheck PRD v1.0  
+**Companion to:** MailCheck PRD v2.0  
 **Design concept:** The Dead Letter Office
 
 ## 1. Executive summary
@@ -117,9 +117,10 @@ Touch targets are at least 44×44px. No horizontal page scroll at 320px width.
 - Live counter: "N addresses · max 1,000".
 - Buttons:
   - **Verify** (primary): solid `--ink` block, `--paper` text, 3px offset hard shadow in `--ink-red`.
-  - **Clear** (secondary): outlined.
-  - **Load sample** (tertiary text button): fills the example list from the assignment.
-- Validation messages appear directly under the textarea as a bordered note, never as a popup.
+  - **Cancel** (`#cancel-btn`, secondary, hidden initially): visible during verification to abort in-flight requests and return to idle without losing completed results.
+  - **Clear** (secondary): outlined button to reset all state and inputs.
+  - **Load sample** (tertiary text button): fills the example list from the specification.
+- Validation messages appear directly under the textarea as a bordered note (`#validation-note`, hidden initially), never as an unstyled alert or intrusive popup.
 
 ### 6.2 Status stamps
 
@@ -132,7 +133,7 @@ The primary stamp text is **always the exact status label** used by the API and 
 | `unknown` | UNKNOWN | DEAD LETTER — NOT CONFIRMED | `--ink` | Dashed oval, ? glyph |
 
 Rules:
-- Rotation is deterministic: derived from a hash of the email address, between −4° and +4°, so a result never "wiggles" between renders.
+- Rotation is deterministic: derived from a hash of the email address, mapped to pre-baked rotation CSS utility classes (`stamp-rot-n40` ... `stamp-rot-p40`) between −4° and +4°, ensuring strict CSP compliance with zero inline `style=` attributes.
 - Stamp text never exceeds 4° rotation so it remains readable.
 - Stamps do not use `role="img"`; the status word is real text in the DOM so screen readers read it directly.
 - Ink opacity 0.9, with the roughness filter from §4.3.
@@ -144,7 +145,7 @@ Four cubby buttons: **All**, **Likely Deliverable**, **Likely Bounce**, **Unknow
 - Each shows the count in Anton at large size, with the label beneath.
 - Styled as kraft-coloured sorting slots with a visible inner border.
 - Clicking filters the ledger. Active cubby shows `aria-pressed="true"` and a thick underline.
-- Counts always sum to the total of non-empty submitted addresses (PRD §13).
+- Counts are occurrence-weighted: duplicate occurrences add their full occurrence count (`item.count || item.occurrences || 1`), ensuring the totals sum exactly to the submitted non-empty address count.
 
 ### 6.4 Ledger (results table)
 
@@ -153,7 +154,7 @@ Semantic `<table>` with `<caption>`, `<thead>` and `scope="col"` headers.
 | Column | Content |
 |---|---|
 | # | Row number in Courier Prime |
-| Address | The submitted address, monospace, break-all on narrow screens |
+| Address | The submitted address (first-seen casing, with `× N` duplicate badge if duplicated), monospace, break-all on narrow screens |
 | Status | The stamp (§6.2) |
 | Reason | One human-readable sentence from the API |
 | Postmarks | Three check postmarks (§6.5) |
@@ -174,21 +175,23 @@ Three small circular marks per row, one for each check from the API's `checks` o
 
 - Circle outline plus the abbreviation (SYN, MX, RCPT) and the state word on two lines, in uppercase at a minimum of 11px. Postmarks are the only place text may be smaller than 16px; all other text is 16px or larger.
 - Failed or negative states use `--ink-red-text`; positive states use `--ink-blue`; not-checked and inconclusive use `--ink` with a dashed outline.
-- **Recipient: NOT CHECKED** is expected to be the most common state on the Vercel deployment. It is shown prominently on purpose, so the limitation is visible instead of hidden.
+- **Recipient: NOT CHECKED** is the honest default state when Port 25 is blocked and no external verification API is configured.
 - Each postmark has a `title` and visually hidden text, for example "Recipient check: not checked".
 
-### 6.6 Progress
+### 6.6 Progress & Error Handling
 
-Large batches are sent to the API in chunks of 100 addresses so each serverless call stays within the platform timeout.
+Large batches are sent to the API in chunks of 50 unique addresses with a 20000ms client timeout so each serverless call stays comfortably within Vercel's 15s `maxDuration` and 8000ms batch budget.
 
 - A paper-tape progress strip reads "Sorted 300 of 1,000".
-- Stamps land as each chunk returns, so the user sees results progressively.
+- Interactive cancellation is supported via `#cancel-btn` and `#cancel-btn-collapsed`.
+- If a batch fails (partially or fully), a visible `#error-banner` displays the exact failure reason and provides `#retry-btn` to re-attempt only failed chunks without re-processing successful rows.
 - Progress text sits in an `aria-live="polite"` region and updates at most once per chunk.
 
-### 6.7 Export (optional, PRD §6)
+### 6.7 Export
 
 - **Bundle results (CSV)** button and **Copy results** button above the ledger.
-- CSV columns: email, status, reason, syntax, mx, recipient.
+- Exact 7 CSV columns: `email,status,reason,syntax,mx,recipient,occurrences`.
+- Formula sanitization: prefixes formula injection triggers (`=`, `+`, `-`, `@`, `|`, `%`, `\t`, `\r`, `\n`, and full-width Unicode variants `\uFF1D`, `\uFF0B`, `\uFF0D`, `\uFF20`, `\u2212`, `\uFE62`, `\uFE63`, `\uFE66`) with `'` and replaces internal newlines with space.
 - Buttons appear only when there is at least one result.
 
 ## 7. Interaction and motion
@@ -250,7 +253,7 @@ Tone: plain, dry, slightly postal. Humour is light and never obscures meaning. E
 | Reason, recipient accepted | Recipient verification received a positive response |
 | Reason, timeout | The check timed out, so the result is inconclusive |
 | Footnote (always visible) | A postmark proves a letter was posted, not that anyone lives at the address. MX records show that a domain can receive mail, not that a particular mailbox exists. Results are predictions, not guarantees. |
-| Privacy line | Addresses are checked and discarded. Nothing is stored and no emails are sent. |
+| Privacy line | Addresses are checked in memory and discarded without database or browser storage, unless an optional external verification API is configured. No emails are sent. |
 
 Reason strings must match those produced by the backend; the UI renders what the API returns and does not invent its own.
 

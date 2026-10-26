@@ -1,133 +1,159 @@
 # MailCheck — Technology Stack Document
 
-**Version:** 1.0  
-**Date:** 25 October 2026  
-**Based on:** MailCheck PRD v1.0 and MailCheck Design Document v1.0  
+**Version:** 2.0 (Hardened Production Release)  
+**Date:** 26 October 2026  
+**Based on:** MailCheck PRD v2.0 and MailCheck Design Document v2.0  
 **Design concept:** *The Dead Letter Office*
 
 ## 1. Recommendation at a glance
 
-Build MailCheck as a **static website with a small serverless backend**. Use plain HTML, CSS, and JavaScript on the frontend, one Node.js API route on Vercel, Node's built-in DNS functions for MX checks, and a small validation library for email syntax. Do not add a frontend framework, database, AI model, or bundler for the MVP.
+Build MailCheck as a **static website with a hardened serverless backend**. Use plain HTML, CSS, and JavaScript on the frontend, one Node.js API route on Vercel, Node's built-in DNS functions for MX checks with parallel A/AAAA fallback, a lazy `gmail.com` resolver canary, and RFC 5321 / 6531 byte-accurate syntax validation. Do not add a frontend framework, database, AI model, or bundler.
 
 | Area | Selected technology | Why it fits |
 |---|---|---|
-| Frontend | HTML5 | Semantic, accessible page structure; no framework required |
-| Styling | CSS | Paper-and-ink visual design, responsive layout, texture and stamp effects |
-| Browser logic | Vanilla JavaScript ES modules | Input parsing, filtering, sorting, chunking, progress, rendering and export |
-| Backend | Node.js serverless function | Runs verification logic without managing a server |
-| Backend endpoint | `POST /api/verify` in `api/verify.js` | Matches the PRD/design API contract and Vercel's function model |
-| Email syntax | `validator` npm package (`isEmail`) or equivalent maintained validator | Avoids maintaining a custom syntax parser |
-| DNS/MX | Node.js built-in `node:dns/promises` | Looks up MX records without a paid verification API |
-| Hosting | Vercel | Serves static files and the API function from one deployment |
-| Source control | Git + GitHub (recommended) | Version history and straightforward Vercel deployment |
-| Tests | Node.js built-in test runner (`node:test`) | Tests classification and API helper logic without a large test framework |
-| Fonts | Self-hosted WOFF2 files for Anton, Courier Prime and Special Elite | Matches the design and avoids runtime font-provider requests |
-| Data storage | None | The MVP processes submissions and discards them; no accounts or database |
+| Frontend | HTML5 | Semantic, accessible page structure with zero inline styles; strict CSP compliant |
+| Styling | CSS | Paper-and-ink visual design, responsive layout, texture, and stamp rotation utility classes |
+| Browser logic | Vanilla JavaScript ES modules | Input parsing, case-insensitive deduplication, 50-address chunks, 20000ms timeout, `#cancel-btn` |
+| Backend | Node.js serverless function (`api/verify.js`) | 15s `maxDuration`, 8000ms batch budget, 11000ms hard cutoff, 64 KB body limit |
+| Backend endpoint | `POST /api/verify` in `api/verify.js` | Accepts up to 100 unique addresses from up to 1,000 raw lines |
+| Email syntax | `validator` (`isEmail`) + RFC byte checks | Enforces 64-octet local-part, 253-octet domain, 254-octet total UTF-8 byte limits |
+| DNS/MX | Node.js built-in `node:dns/promises` | 25 concurrency, 2000ms timeout, parallel A/AAAA fallback, RFC 7505 Null MX, lazy canary |
+| SSRF Defense | Node.js built-in `node:net.BlockList` | Blocks loopback, RFC 1918, link-local, multicast, NAT64, 6to4, and IPv4-mapped IPv6 |
+| SMTP Probing | Node.js built-in `node:net` | Lightweight non-sending probe with single-flight catch-all detection promise coalescing |
+| Hosting | Vercel | Serves static assets with strict security headers (`Cache-Control: public, max-age=0, must-revalidate`) |
+| Source control | Git + GitHub | Version history and automated CI/CD (`.github/workflows/ci.yml`) |
+| Tests | Node.js built-in test runner (`node:test`) | 80 automated tests across 22 suites with 0 external network dependencies |
+| Fonts | Self-hosted WOFF2 files (Anton, Courier Prime, Special Elite) | Matches design and eliminates external font-provider tracking |
+| Data storage | None | Submissions are checked in memory and discarded; zero database or browser storage |
 
 ## 2. System architecture
 
 ```text
 User's browser
-  ├─ index.html      → semantic page structure
-  ├─ styles.css      → paper, ink, stamps, responsive/accessibility styles
-  └─ app.js          → input parsing, deduplication, filters, table, progress
+  ├─ index.html      → semantic page structure (zero inline styles, #cancel-btn, #error-banner)
+  ├─ styles.css      → paper, ink, stamps, responsive/accessibility styles, .svg-defs
+  └─ app.js          → input parsing, case-insensitive deduplication, 50-address chunks, 20s timeout
            │
-           │ POST /api/verify with up to 100 unique addresses per request
+           │ POST /api/verify with up to 50 unique addresses per chunk (API limit 100 unique / 1,000 raw)
            ▼
-Vercel Node.js Function: api/verify.js
-  ├─ validates request and limits
-  ├─ checks address syntax
-  ├─ looks up domain MX records using node:dns/promises
+Vercel Node.js Function: api/verify.js (15s maxDuration, 8000ms budget, 11000ms hard cutoff)
+  ├─ enforces IP rate limit (60 req / 60s per client IP, strictly guarding proxy headers)
+  ├─ validates request payload (max 64 KB, max 1,000 raw lines, max 100 unique addresses)
+  ├─ case-insensitively deduplicates (toLowerCase) while preserving first-seen casing & counting occurrences
+  ├─ checks RFC 5321 / RFC 6531 UTF-8 byte limits (64 octets local-part, 254 octets total)
+  ├─ looks up domain MX records with 25 concurrency, 2000ms timeout, and lazy gmail.com resolver canary
+  ├─ Stage 3: bounded concurrency recipient verification (max 10 concurrent):
+  │    ├─ Tier 1. Tested Emailable v1 HTTPS adapter (SSRF-protected, Bearer auth, 4000ms timeout)
+  │    ├─ Tier 2. Direct Port 25 SMTP probe (if enabled, single-flight catch-all probe, 2500ms timeout)
+  │    └─ Default. Honest serverless fallback (Port 25 blocked on Vercel)
   ├─ assigns conservative status and reason
-  └─ returns structured JSON; no email is sent
+  └─ returns structured JSON with occurrence-weighted and unique counts; no email is sent
            │
            ▼
-Browser renders stamps, postmarks and counts
+Browser renders stamps, postmarks, duplicate badges (× N), and pigeonhole counts progressively
 ```
 
-The browser accepts up to 1,000 non-empty address entries, collapses duplicate addresses for display, and sends unique addresses to the API in chunks of 100. Progress is shown after each chunk. Aggregate counts should account for duplicate frequency so the four status totals still sum to the total number of non-empty submitted entries, while the ledger can show one row per unique address with an `× N` duplicate marker.
+The browser accepts up to 1,000 non-empty address entries, collapses duplicate addresses case-insensitively (`toLowerCase()`) for display while preserving the first-seen casing, and sends unique addresses to the API in chunks of 50. Progress is shown after each chunk. Aggregate counts account for duplicate frequency (`item.occurrences || item.count || 1`) so the four status totals sum to the total number of non-empty submitted entries, while the ledger shows one row per unique address with an `× N` duplicate marker.
 
 ## 3. Frontend stack
 
 ### HTML
-
-Use semantic HTML elements, including a labelled `<textarea>`, buttons, a results `<table>` with `<caption>`, `<thead>` and column scopes, and visible validation/error messages. Keep status words as real DOM text rather than image-only stamps.
+Use semantic HTML elements, including a labelled `<textarea>`, buttons (including `#cancel-btn`), a results `<table>` with `<caption>`, `<thead>` and column scopes, a progress strip (`#progress-strip`, initially `hidden`), and an error banner (`#error-banner`, initially `hidden`) with `#retry-btn`. Zero inline `style=` attributes are permitted anywhere in the document.
 
 ### CSS
+Use CSS custom properties for the colour tokens defined in the design document. Implement the paper background, ruled intake slip, perforation dividers, stamps, responsive layouts, high-contrast mode, and plain-view toggle in CSS. Use SVG filters for paper grain and stamp roughness, with `.svg-defs` styled purely in CSS (`position: absolute; width: 0; height: 0; overflow: hidden; pointer-events: none;`).
 
-Use CSS custom properties for the colour tokens defined in the design document. Implement the paper background, ruled intake slip, perforation dividers, stamps, responsive layouts, high-contrast mode, and plain-view toggle in CSS. Use inline SVG filters for paper grain and stamp roughness; no image assets are needed.
-
-Use the design document's three typefaces, self-hosted as WOFF2: Anton for display text, Courier Prime for body/address text, and Special Elite for stamps. Keep fallback fonts defined. Check font licensing before redistributing the font files.
+Use the design document's three typefaces, self-hosted as WOFF2: Anton for display text, Courier Prime for body/address text, and Special Elite for stamps.
 
 ### Vanilla JavaScript (`app.js`)
-
-Use ES modules and browser APIs only; no React, Vue, build system, or bundler is required. The frontend owns:
-
+Use ES modules and browser APIs only; no framework or bundler is required. The frontend owns:
 - splitting the textarea into lines, trimming whitespace, ignoring blank lines and enforcing the 1,000-entry limit;
-- normalizing and deduplicating addresses for checks/display, while retaining duplicate counts;
-- calling `/api/verify` in chunks of 100;
-- progress text and partial-failure handling;
+- case-insensitively normalizing and deduplicating addresses using `getDedupeKey` (`toLowerCase()`), while retaining first-seen casing and duplicate counts;
+- calling `/api/verify` in chunks of 50 unique addresses with a 20000ms client `AbortController` timeout;
+- interactive cancellation via `#cancel-btn` and error recovery via `#retry-btn`;
 - rendering results safely with `textContent`, never `innerHTML` for user-supplied values;
-- filter cubbies, sortable table headings, copy and CSV export;
-- the stamp animation, keyboard interactions, `aria-live` progress, reduced-motion handling and Plain view toggle.
+- Pigeonhole filter cubbies with occurrence-weighted totals, sortable table headings, clipboard copy and formula-safe CSV export (`email,status,reason,syntax,mx,recipient,occurrences`);
+- formula sanitization prefixing formula injection triggers (`=`, `+`, `-`, `@`, `|`, `%`, `\t`, `\r`, `\n`, `\uFF1D`, `\uFF0B`, `\uFF0D`, `\uFF20`, `\u2212`, `\uFE62`, `\uFE63`, `\uFE66`) with `'` and replacing internal newlines with space.
 
 ## 4. Backend stack
 
 ### Runtime and deployment
-
-Use a Vercel Node.js Function at `api/verify.js`. The function processes one batch of at most 100 unique addresses. It does not need Express or a long-running server. Keep verification logic in small helpers so it can be tested independently.
+Use a Vercel Node.js Function at `api/verify.js` with `maxDuration: 15`. The function processes batches of at most 100 unique addresses (from up to 1,000 raw lines, 64 KB request body). It enforces an 8000ms batch time budget with an 11000ms hard cutoff.
 
 ### Syntax validation
-
-Use the `validator` package's `isEmail` function or an equivalent maintained email syntax library. Syntax validation establishes only that an address is plausible in format; it does not establish that the domain or mailbox exists.
+Use the `validator` package (`isEmail`) combined with RFC 5321 / RFC 6531 byte-accurate limits via `Buffer.byteLength(str, 'utf8')`. Enforces <= 64 octets in local-part, <= 253 octets in ASCII punycode domain, and <= 254 octets in total normalized address.
 
 ### DNS/MX checks
-
-Use Node.js `node:dns/promises`, particularly MX resolution, to inspect the domain's email routing. Handle outcomes deliberately:
-
+Use Node.js `node:dns/promises` with 25 concurrency and 2000ms timeout per query:
 - usable MX records found → `mx: "found"`;
-- confirmed domain not found → `mx: "domain_not_found"`;
-- confirmed absence of usable mail routing → `mx: "none"`;
-- transient resolver error or timeout → `mx: "error"` or an equivalent documented inconclusive state.
-
-Consider applicable mail-routing fallback behavior before classifying a domain as having no usable route. A temporary DNS failure is not proof that a domain does not exist.
+- RFC 7505 Null MX detected (exchange `.` or `""`) → `mx: "none"`;
+- confirmed absence of usable mail routing after parallel A/AAAA fallback → `mx: "none"`;
+- transient resolver error or timeout → `mx: "error"`;
+- lazy per-batch `gmail.com` DNS resolver health canary check: if any domain encounters `ENOTFOUND` or `ENODATA`, queries `gmail.com`. If `gmail.com` also fails, detects broken sandbox resolver and returns `mx: "error"`, `status: "unknown"` instead of false bounce.
 
 ### SMTP and third-party verification
-
-**Do not make direct SMTP recipient verification a required part of the initial Vercel implementation.** Vercel blocks outbound TCP port 25, which is commonly used for direct mail-server connections. Mail servers may also conceal mailbox existence or accept all recipients during a probe.
-
-For the MVP, set `checks.recipient` to `"not_checked"` unless a permitted, configured verification mechanism actually runs. If the project later integrates a third-party verification API, call it only from the backend, store the API key in a Vercel environment variable, and document the provider's cost, quotas, privacy terms and failure states. Never put an API key in `app.js` or another public asset.
-
-A positive domain/MX check alone must never produce `likely_deliverable`. Reserve that status for sufficient recipient-level evidence from a configured method. In the no-provider Vercel MVP, many plausible addresses will correctly remain `unknown`.
+Outbound TCP port 25 is blocked on Vercel. For recipient verification:
+- **Tier 1 (HTTPS External API)**: If `EMAIL_VERIFICATION_API_KEY` is set, verifies recipient over HTTPS Port 443 with Bearer authorization and a 4000ms timeout. Strictly validates URL scheme (`https:`) and blocks SSRF targets (`net.BlockList`, localhost, `.local`, `.internal`, `.lan`).
+- **Tier 2 (Direct SMTP Probe)**: When permitted (`ENABLE_SMTP_PROBE=true`), executes non-sending socket probe on Port 25 with 2500ms timeout and single-flight Promise catch-all coalescing.
+- **Default (Honest Fallback)**: In standard Vercel deployments, valid syntax + MX records honestly returns `checks.recipient: "not_checked"`, `status: "unknown"`, `"Domain accepts mail, but the mailbox was not confirmed"`.
 
 ## 5. API contract
 
 **Endpoint:** `POST /api/verify`  
-**Maximum batch:** 100 unique addresses per call.
+**Limits:** Maximum 64 KB request body, 1,000 raw email lines, 100 unique deduplicated addresses.
 
 Example request:
-
 ```json
 {
-  "emails": ["alice@example.com", "bad-address"]
+  "emails": ["Alice@gmail.com", "alice@gmail.com", "wrong-email", "someone@nonexistent-domain-xyz.com"]
 }
 ```
 
-Example response shape:
-
+Example response:
 ```json
 {
   "results": [
     {
-      "email": "alice@example.com",
+      "email": "Alice@gmail.com",
       "status": "unknown",
       "reason": "Domain accepts mail, but the mailbox was not confirmed",
-      "checks": {
-        "syntax": "pass",
-        "mx": "found",
-        "recipient": "not_checked"
-      }
+      "checks": { "syntax": "pass", "mx": "found", "recipient": "not_checked" },
+      "occurrences": 2
+    },
+    {
+      "email": "wrong-email",
+      "status": "likely_bounce",
+      "reason": "Invalid email format",
+      "checks": { "syntax": "fail", "mx": "not_checked", "recipient": "not_checked" },
+      "occurrences": 1
+    },
+    {
+      "email": "someone@nonexistent-domain-xyz.com",
+      "status": "likely_bounce",
+      "reason": "Domain cannot be resolved",
+      "checks": { "syntax": "pass", "mx": "domain_not_found", "recipient": "not_checked" },
+      "occurrences": 1
     }
+  ],
+  "summary": {
+    "total": 4,
+    "likely_deliverable": 0,
+    "likely_bounce": 2,
+    "unknown": 2,
+    "submitted_count": 4,
+    "unique_count": 3,
+    "unique_summary": {
+      "total": 3,
+      "likely_deliverable": 0,
+      "likely_bounce": 2,
+      "unknown": 1
+    }
+  }
+}
+```
+
+## 6. Privacy notice
+Addresses are checked in memory and discarded without database or browser storage, unless an optional external verification API is configured. No emails are sent.
   ],
   "summary": {
     "total": 1,

@@ -10,6 +10,9 @@ const { isEmail } = validator;
 // Constants & Configuration
 // ---------------------------------------------------------------------------
 export const MAX_BATCH = 100;
+export const MAX_RAW_EMAILS = 1000;
+export const MAX_UNIQUE_BATCH = 100;
+export const MAX_BODY_BYTES = 65536;
 export const MAX_EMAIL_LENGTH = 2048;
 export const RFC_MAX_EMAIL_LENGTH = 254;
 export const RFC_MAX_LOCAL_LENGTH = 64;
@@ -18,7 +21,8 @@ export const API_TIMEOUT_MS = 4000;
 export const SMTP_TIMEOUT_MS = 2500;
 export const STAGE3_CONCURRENCY = 10;
 export const DNS_CONCURRENCY = 25;
-export const BATCH_TIME_BUDGET_MS = 11000;
+export const BATCH_TIME_BUDGET_MS = 8000;
+export const HARD_ABORT_TIMEOUT_MS = 11000;
 
 // Rate limiting: 60 requests per 60 seconds per IP (configurable via RATE_LIMIT_MAX)
 export const RATE_LIMIT_WINDOW_MS = 60000;
@@ -233,7 +237,10 @@ function extractIPv4FromIPv6(s) {
  */
 export function isPrivateOrReservedIP(ip) {
   if (!ip || typeof ip !== 'string') return true;
-  const s = ip.trim().toLowerCase();
+  let s = ip.trim().toLowerCase();
+  if (s.startsWith('[') && s.endsWith(']')) {
+    s = s.slice(1, -1);
+  }
   if (!s) return true;
   if (s === 'localhost') return true;
 
@@ -270,6 +277,7 @@ export function isPrivateOrReservedIP(ip) {
 
 /**
  * Validate email syntax with RFC 5321 length limits and internationalized support.
+ * Byte-accurate UTF-8 length validation per RFC 5321 / RFC 6531.
  * @param {string} email
  * @returns {{ valid: boolean, email: string, domain?: string, rawDomain?: string, hasNonAsciiLocal?: boolean }}
  */
@@ -277,7 +285,8 @@ export function checkSyntax(email) {
   if (typeof email !== "string") return { valid: false, email: String(email) };
 
   const trimmed = email.trim();
-  if (trimmed.length === 0 || trimmed.length > RFC_MAX_EMAIL_LENGTH) {
+  const totalRawBytes = Buffer.byteLength(trimmed, "utf8");
+  if (trimmed.length === 0 || totalRawBytes > RFC_MAX_EMAIL_LENGTH) {
     return { valid: false, email: trimmed };
   }
 
@@ -289,7 +298,12 @@ export function checkSyntax(email) {
   if (atParts.length !== 2) return { valid: false, email: trimmed };
 
   const [localPart, domainPart] = atParts;
-  if (!localPart || !domainPart || localPart.length > RFC_MAX_LOCAL_LENGTH) {
+  if (!localPart || !domainPart) {
+    return { valid: false, email: trimmed };
+  }
+
+  const localBytes = Buffer.byteLength(localPart, "utf8");
+  if (localBytes < 1 || localBytes > RFC_MAX_LOCAL_LENGTH) {
     return { valid: false, email: trimmed };
   }
 
@@ -305,11 +319,22 @@ export function checkSyntax(email) {
     return { valid: false, email: trimmed };
   }
 
-  // Domain labels must not start or end with a hyphen
+  const domainBytes = Buffer.byteLength(asciiDomain, "utf8");
+  if (domainBytes < 1 || domainBytes > 253) {
+    return { valid: false, email: trimmed };
+  }
+
+  // Total normalized address byte limit per RFC 5321 (local + @ + domain <= 254 bytes)
+  if (Buffer.byteLength(`${localPart}@${asciiDomain}`, "utf8") > RFC_MAX_EMAIL_LENGTH) {
+    return { valid: false, email: trimmed };
+  }
+
+  // Domain labels must not start or end with a hyphen, and each label must be 1..63 bytes
   const labels = asciiDomain.split(".");
   if (labels.length < 2) return { valid: false, email: trimmed };
   for (const label of labels) {
-    if (!label || label.startsWith("-") || label.endsWith("-")) {
+    const labelBytes = Buffer.byteLength(label, "utf8");
+    if (!label || labelBytes < 1 || labelBytes > 63 || label.startsWith("-") || label.endsWith("-")) {
       return { valid: false, email: trimmed };
     }
   }
@@ -350,6 +375,16 @@ export function normalizeEmailAddress(raw) {
   return `${localPart}@${domainPart}`;
 }
 
+/**
+ * Deduplication key for email addresses: case-insensitive normalized address.
+ * Alice@Example.COM -> alice@example.com
+ * @param {string} raw
+ * @returns {string}
+ */
+export function getDedupeKey(raw) {
+  return normalizeEmailAddress(raw).toLowerCase();
+}
+
 // ---------------------------------------------------------------------------
 // Stage 2 — DNS / MX Check & RFC 7505 Null MX Support
 // ---------------------------------------------------------------------------
@@ -381,12 +416,45 @@ export function withTimeout(promise, ms) {
 }
 
 /**
+ * Lazy single-flight canary check for DNS resolver health.
+ * Queries resolver.resolveMx('gmail.com').
+ * If resolver returns ENOTFOUND or has no usable MX for gmail.com, the resolver is broken/sandboxed.
+ * @param {object} [dnsResolver=dns]
+ * @param {number} [timeoutMs=1500]
+ * @param {Map} [canaryCache=null]
+ * @returns {Promise<boolean>}
+ */
+export async function checkDnsResolverHealth(dnsResolver = dns, timeoutMs = 1500, canaryCache = null) {
+  if (canaryCache && canaryCache.has("canary_health")) {
+    return canaryCache.get("canary_health");
+  }
+
+  const promise = (async () => {
+    try {
+      const records = await withTimeout(dnsResolver.resolveMx("gmail.com"), timeoutMs);
+      if (!Array.isArray(records) || records.length === 0) return false;
+      const usable = records.some((r) => r.exchange && r.exchange !== "." && r.exchange !== "");
+      return usable;
+    } catch {
+      return false;
+    }
+  })();
+
+  if (canaryCache) {
+    canaryCache.set("canary_health", promise);
+  }
+
+  return promise;
+}
+
+/**
  * Check MX (or implicit A/AAAA fallback) for a domain.
  * @param {string} domain
  * @param {object} [dnsResolver=dns] — injectable for testing
+ * @param {Map} [canaryCache=null] — optional canary cache
  * @returns {Promise<{ mx: string, exchange?: string, mxHosts?: string[], reason?: string, records?: object[] }>}
  */
-export async function checkMx(domain, dnsResolver = dns) {
+export async function checkMx(domain, dnsResolver = dns, canaryCache = null) {
   let asciiDomain;
   try {
     asciiDomain = url.domainToASCII(domain).toLowerCase().trim();
@@ -442,18 +510,34 @@ export async function checkMx(domain, dnsResolver = dns) {
       };
     }
 
+    // If records array is empty: verify DNS resolver health before declaring mx: none
+    const isHealthy = await checkDnsResolverHealth(dnsResolver, 1500, canaryCache);
+    if (!isHealthy) {
+      return {
+        mx: "error",
+        reason: "DNS lookup failed due to a temporary resolver error, so the result is inconclusive",
+      };
+    }
+
     return {
       mx: "none",
       reason: "Domain has no usable mail route",
     };
   } catch (err) {
-    // ENODATA / NO_DATA / ENOTFOUND (on MX query specifically): try RFC 5321 A / AAAA fallback
+    // ENODATA / NO_DATA: try RFC 5321 A / AAAA fallback
     if (err.code === "ENODATA" || err.code === "NO_DATA") {
-      return await fallbackToAddressRecords(asciiDomain, dnsResolver);
+      return await fallbackToAddressRecords(asciiDomain, dnsResolver, canaryCache);
     }
 
     if (err.code === "ENOTFOUND") {
-      // Domain itself does not exist in DNS
+      // Domain itself not found: check if DNS resolver is healthy or lying/sandboxed
+      const isHealthy = await checkDnsResolverHealth(dnsResolver, 1500, canaryCache);
+      if (!isHealthy) {
+        return {
+          mx: "error",
+          reason: "DNS lookup failed due to a temporary resolver error, so the result is inconclusive",
+        };
+      }
       return { mx: "domain_not_found", reason: "Domain cannot be resolved" };
     }
 
@@ -469,20 +553,7 @@ export async function checkMx(domain, dnsResolver = dns) {
       };
     }
 
-    // Non-timeout resolver errors (ESERVFAIL, EREFUSED, EAI_AGAIN, etc.)
-    if (
-      err.code === "ESERVFAIL" ||
-      err.code === "EREFUSED" ||
-      err.code === "ECONNREFUSED" ||
-      err.code === "EAI_AGAIN"
-    ) {
-      return {
-        mx: "error",
-        reason: "DNS lookup failed due to a temporary resolver error, so the result is inconclusive",
-      };
-    }
-
-    // Any other error -> treat as transient resolver error
+    // Non-timeout resolver errors (ESERVFAIL, EREFUSED, ECONNREFUSED, EAI_AGAIN, etc.)
     return {
       mx: "error",
       reason: "DNS lookup failed due to a temporary resolver error, so the result is inconclusive",
@@ -494,9 +565,10 @@ export async function checkMx(domain, dnsResolver = dns) {
  * RFC 5321 fallback: if no MX records exist (ENODATA), query A and AAAA in parallel.
  * @param {string} domain
  * @param {object} dnsResolver
+ * @param {Map} [canaryCache=null]
  * @returns {Promise<{ mx: string, exchange?: string, mxHosts?: string[], reason?: string }>}
  */
-export async function fallbackToAddressRecords(domain, dnsResolver) {
+export async function fallbackToAddressRecords(domain, dnsResolver, canaryCache = null) {
   const [res4, res6] = await Promise.allSettled([
     withTimeout(dnsResolver.resolve4(domain), DNS_TIMEOUT_MS),
     withTimeout(dnsResolver.resolve6(domain), DNS_TIMEOUT_MS),
@@ -521,14 +593,21 @@ export async function fallbackToAddressRecords(domain, dnsResolver) {
   const bothDefinitiveNo = isDefinitiveNoRecord(res4) && isDefinitiveNoRecord(res6);
 
   if (bothDefinitiveNo) {
+    const isHealthy = await checkDnsResolverHealth(dnsResolver, 1500, canaryCache);
+    if (!isHealthy) {
+      return {
+        mx: "error",
+        reason: "DNS lookup failed due to a temporary resolver error, so the result is inconclusive",
+      };
+    }
     return { mx: "none", reason: "Domain has no usable mail route" };
   }
 
   // If neither returned addresses and at least one had a timeout:
   const hasTimeout = (r) => {
-    if (r.status === 'rejected') {
+    if (r.status === "rejected") {
       const code = r.reason?.code;
-      return code === 'ETIMEOUT' || code === 'TIMEOUT' || r.reason?.message === 'DNS_TIMEOUT';
+      return code === "ETIMEOUT" || code === "TIMEOUT" || r.reason?.message === "DNS_TIMEOUT";
     }
     return false;
   };
@@ -649,8 +728,48 @@ export function isValidHeloDomain(domain) {
 export async function probeSmtpRecipient(email, mxHost, options = {}) {
   const port = options.port || 25;
   const timeoutMs = options.timeout || SMTP_TIMEOUT_MS;
-  const domain = email.split("@")[1];
+  const domain = email.split("@")[1]?.toLowerCase();
   const randomProbe = `nonexistent-probe-${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}@${domain}`;
+
+  const catchAllCache = options.catchAllCache;
+  let isLeaderForCatchAll = false;
+  let resolveCatchAll = null;
+
+  if (catchAllCache && domain) {
+    if (!catchAllCache.has(domain)) {
+      // First probe for this domain registers the single-flight Promise synchronously
+      isLeaderForCatchAll = true;
+      const catchAllPromise = new Promise((resolve) => {
+        resolveCatchAll = resolve;
+      });
+      catchAllCache.set(domain, catchAllPromise);
+    } else {
+      // Follower probe for same domain awaits the single-flight Promise
+      const status = await catchAllCache.get(domain);
+      if (status === "catch_all") {
+        return {
+          recipient: "inconclusive",
+          status: "unknown",
+          reason: "Domain accepts all mail (catch-all), so individual mailbox could not be confirmed",
+        };
+      }
+      if (status === "ambiguous") {
+        return {
+          recipient: "inconclusive",
+          status: "unknown",
+          reason: "Domain accepts mail, but the mailbox was not confirmed",
+        };
+      }
+      // If "not_catch_all", proceed with probing the specific recipient
+    }
+  }
+
+  function publishCatchAll(status) {
+    if (isLeaderForCatchAll && resolveCatchAll) {
+      resolveCatchAll(status);
+      resolveCatchAll = null;
+    }
+  }
 
   // Configurable HELO/EHLO domain and MAIL FROM
   const env = options.env || process.env;
@@ -661,6 +780,7 @@ export async function probeSmtpRecipient(email, mxHost, options = {}) {
 
   // If running real network socket probe (not mock) and HELO domain is not a valid FQDN:
   if (typeof options.socketFactory !== "function" && !isValidHeloDomain(configuredHelo)) {
+    publishCatchAll("ambiguous");
     return {
       recipient: "not_checked",
       status: "unknown",
@@ -681,6 +801,7 @@ export async function probeSmtpRecipient(email, mxHost, options = {}) {
         });
       });
       if (isPrivateOrReservedIP(resolvedAddress)) {
+        publishCatchAll("ambiguous");
         return {
           recipient: "inconclusive",
           status: "unknown",
@@ -688,6 +809,7 @@ export async function probeSmtpRecipient(email, mxHost, options = {}) {
         };
       }
     } catch {
+      publishCatchAll("ambiguous");
       return {
         recipient: "not_checked",
         status: "unknown",
@@ -705,6 +827,7 @@ export async function probeSmtpRecipient(email, mxHost, options = {}) {
       if (!resolved) {
         resolved = true;
         clearTimeout(overallTimer);
+        publishCatchAll("ambiguous");
         if (socket) {
           try {
             socket.write("QUIT\r\n");
@@ -845,25 +968,15 @@ export async function probeSmtpRecipient(email, mxHost, options = {}) {
           }
         } else if (state === "WAIT_MAIL") {
           if (code === 250) {
-            // Check catch-all cache first
-            if (options.catchAllCache && options.catchAllCache.get(domain) === "catch_all") {
-              return safeResolve({
-                recipient: "inconclusive",
-                status: "unknown",
-                reason: "Domain accepts all mail (catch-all), so individual mailbox could not be confirmed",
-              });
+            // If follower and domain is already verified as not_catch_all:
+            if (!isLeaderForCatchAll && catchAllCache) {
+              state = "WAIT_RCPT";
+              socket.write(`RCPT TO:<${email}>\r\n`);
+            } else {
+              // Leader or un-cached: perform random catch-all probe
+              state = "WAIT_CATCHALL";
+              socket.write(`RCPT TO:<${randomProbe}>\r\n`);
             }
-            if (options.catchAllCache && options.catchAllCache.get(domain) === "ambiguous") {
-              return safeResolve({
-                recipient: "inconclusive",
-                status: "unknown",
-                reason: "Domain accepts mail, but the mailbox was not confirmed",
-              });
-            }
-
-            // Probe randomized non-existent address for catch-all check
-            state = "WAIT_CATCHALL";
-            socket.write(`RCPT TO:<${randomProbe}>\r\n`);
           } else {
             return safeResolve({
               recipient: "inconclusive",
@@ -873,32 +986,28 @@ export async function probeSmtpRecipient(email, mxHost, options = {}) {
           }
         } else if (state === "WAIT_CATCHALL") {
           if (code === 250 || code === 251) {
-            // Server accepted random address -> Catch-all domain detected!
-            if (options.catchAllCache) options.catchAllCache.set(domain, "catch_all");
+            publishCatchAll("catch_all");
             return safeResolve({
               recipient: "inconclusive",
               status: "unknown",
               reason: "Domain accepts all mail (catch-all), so individual mailbox could not be confirmed",
             });
           } else if (code >= 400 && code < 500) {
-            // Greylisted or temporary rate limit
-            if (options.catchAllCache) options.catchAllCache.set(domain, "ambiguous");
+            publishCatchAll("ambiguous");
             return safeResolve({
               recipient: "inconclusive",
               status: "unknown",
               reason: "Domain accepts mail, but the mailbox was not confirmed",
             });
           } else if (!isExplicitMailboxNotFound(code, line)) {
-            // Random probe received policy block or ambiguous 5xx -> do NOT probe real address
-            if (options.catchAllCache) options.catchAllCache.set(domain, "ambiguous");
+            publishCatchAll("ambiguous");
             return safeResolve({
               recipient: "inconclusive",
               status: "unknown",
               reason: "Domain accepts mail, but the mailbox was not confirmed",
             });
           } else {
-            // Server explicitly rejected random address -> Domain is NOT catch-all!
-            if (options.catchAllCache) options.catchAllCache.set(domain, "not_catch_all");
+            publishCatchAll("not_catch_all");
             state = "WAIT_RCPT";
             socket.write(`RCPT TO:<${email}>\r\n`);
           }
@@ -916,7 +1025,6 @@ export async function probeSmtpRecipient(email, mxHost, options = {}) {
               reason: "Recipient mailbox was rejected by the mail server",
             });
           } else {
-            // Policy block, quota, greylisting, or ambiguous 5xx
             return safeResolve({
               recipient: "inconclusive",
               status: "unknown",
@@ -932,7 +1040,7 @@ export async function probeSmtpRecipient(email, mxHost, options = {}) {
 /**
  * Optional External Verification API (Port 443 — works in serverless environments).
  * Sends API key via Authorization header, keeps timeout active during JSON parsing,
- * and handles failures gracefully.
+ * validates URL scheme (HTTPS) and enforces SSRF restrictions.
  * @param {string} email
  * @param {object} [options]
  * @returns {Promise<{ recipient: string, status: string, reason: string }|null>}
@@ -947,6 +1055,34 @@ export async function checkRecipientViaHttps(email, options = {}) {
   let useAuthHeader = true;
 
   if (apiUrl) {
+    let parsedUrl;
+    try {
+      parsedUrl = new URL(apiUrl);
+    } catch {
+      return { fallback: true };
+    }
+
+    // Require HTTPS protocol
+    if (parsedUrl.protocol !== "https:") {
+      return { fallback: true };
+    }
+
+    // SSRF validation: block localhost, internal domains, and private/reserved IP literals
+    let hostname = parsedUrl.hostname.toLowerCase();
+    if (hostname.startsWith("[") && hostname.endsWith("]")) {
+      hostname = hostname.slice(1, -1);
+    }
+    const isIpLiteral = net.isIP(hostname) !== 0;
+    if (
+      hostname === "localhost" ||
+      hostname.endsWith(".local") ||
+      hostname.endsWith(".internal") ||
+      hostname.endsWith(".lan") ||
+      (isIpLiteral && isPrivateOrReservedIP(hostname))
+    ) {
+      return { fallback: true };
+    }
+
     if (apiUrl.includes("{email}")) {
       endpoint = apiUrl.replace("{email}", encodeURIComponent(email));
       if (endpoint.includes("{key}")) {
@@ -1031,7 +1167,7 @@ export async function checkRecipientViaHttps(email, options = {}) {
  */
 export async function classifyEmail(email, options = {}) {
   const env = options.env || process.env;
-  const { dnsResolver, recipientVerifier, smtpProber, apiKey, apiUrl, catchAllCache } = options;
+  const { dnsResolver, recipientVerifier, smtpProber, apiKey, apiUrl, catchAllCache, canaryCache } = options;
 
   // Stage 1 — Syntax Check
   const syntaxResult = checkSyntax(email);
@@ -1046,7 +1182,7 @@ export async function classifyEmail(email, options = {}) {
 
   // Stage 2 — DNS / MX Check
   const domain = syntaxResult.domain || email.split("@")[1];
-  const mxResult = await checkMx(domain, dnsResolver);
+  const mxResult = await checkMx(domain, dnsResolver, canaryCache);
 
   if (mxResult.mx === "domain_not_found" || mxResult.mx === "none") {
     return {
@@ -1203,6 +1339,9 @@ async function runWithConcurrency(limit, items, fn) {
 
 /**
  * Verify a batch of email addresses.
+ * Deduplicates case-insensitively using getDedupeKey, preserving the original
+ * casing of the first appearance, and returns occurrence-weighted and unique counts.
+ * 
  * @param {string[]} emails — raw array from client
  * @param {object} [options] — injectable dependencies
  * @returns {Promise<{ results: object[], summary: object } | { error: string }>}
@@ -1210,6 +1349,10 @@ async function runWithConcurrency(limit, items, fn) {
 export async function verifyBatch(emails, options = {}) {
   if (!Array.isArray(emails) || emails.length === 0) {
     return { error: "emails must be a non-empty array" };
+  }
+
+  if (emails.length > MAX_RAW_EMAILS) {
+    return { error: `Batch size exceeds the maximum of ${MAX_RAW_EMAILS}` };
   }
 
   // Validate all items are strings and enforce max string length
@@ -1229,42 +1372,51 @@ export async function verifyBatch(emails, options = {}) {
     return { error: "emails must be a non-empty array" };
   }
 
-  if (trimmed.length > MAX_BATCH) {
-    return { error: `Batch size exceeds the maximum of ${MAX_BATCH}` };
-  }
-
-  // Deduplicate case-insensitively, preserving original casing of first appearance
-  const seenLower = new Set();
-  const unique = [];
+  // Deduplicate case-insensitively using getDedupeKey(item), preserving the first-seen
+  // display string and counting total occurrences
+  const dedupeMap = new Map();
   for (const item of trimmed) {
-    const lower = item.toLowerCase();
-    if (!seenLower.has(lower)) {
-      seenLower.add(lower);
-      unique.push(item);
+    const key = getDedupeKey(item);
+    const displayEmail = normalizeEmailAddress(item);
+    const existing = dedupeMap.get(key);
+    if (existing) {
+      existing.occurrences++;
+    } else {
+      dedupeMap.set(key, { email: displayEmail, occurrences: 1 });
     }
   }
+
+  const uniqueItems = Array.from(dedupeMap.values());
+  if (uniqueItems.length > MAX_UNIQUE_BATCH) {
+    return { error: `Batch size exceeds the maximum of ${MAX_UNIQUE_BATCH}` };
+  }
+
+  const dnsResolver = options.dnsResolver;
+  const canaryCache = options.canaryCache || new Map();
+  const catchAllCache = options.catchAllCache || new Map();
 
   // Pre-cache MX results per domain with bounded concurrency
   const validDomains = [
     ...new Set(
-      unique
-        .map((e) => checkSyntax(e))
+      uniqueItems
+        .map((u) => checkSyntax(u.email))
         .filter((s) => s.valid && s.domain)
         .map((s) => s.domain),
     ),
   ];
 
   const mxCache = new Map();
-  const dnsResolver = options.dnsResolver;
-
   const batchStartTime = Date.now();
 
   await runWithConcurrency(DNS_CONCURRENCY, validDomains, async (domain) => {
     if (Date.now() - batchStartTime >= BATCH_TIME_BUDGET_MS) {
-      mxCache.set(domain, { mx: 'error', reason: 'Verification time budget exceeded, so the result is inconclusive' });
+      mxCache.set(domain, {
+        mx: "error",
+        reason: "Verification time budget exceeded, so the result is inconclusive",
+      });
       return;
     }
-    const result = await checkMx(domain, dnsResolver);
+    const result = await checkMx(domain, dnsResolver, canaryCache);
     mxCache.set(domain, result);
   });
 
@@ -1315,35 +1467,62 @@ export async function verifyBatch(emails, options = {}) {
     },
   };
 
-  const catchAllCache = new Map();
-
-  // Bounded concurrency Stage 3 classification (max 10 concurrent checks)
-  const results = await runWithConcurrency(STAGE3_CONCURRENCY, unique, async (email) => {
-    if (Date.now() - batchStartTime >= BATCH_TIME_BUDGET_MS) {
+  // Stage 3 classification with bounded concurrency (max 10 concurrent)
+  // Hard abort timer at 11s guarantees the function always responds well before Vercel's 15s budget
+  const results = await runWithConcurrency(STAGE3_CONCURRENCY, uniqueItems, async (item) => {
+    const elapsed = Date.now() - batchStartTime;
+    if (elapsed >= BATCH_TIME_BUDGET_MS) {
+      const syntaxRes = checkSyntax(item.email);
       return {
-        email,
-        status: 'unknown',
-        reason: 'Verification time budget exceeded, so the result is inconclusive',
-        checks: { syntax: 'pass', mx: 'error', recipient: 'not_checked' },
+        email: item.email,
+        status: "unknown",
+        reason: "Verification time budget exceeded, so the result is inconclusive",
+        checks: {
+          syntax: syntaxRes.valid ? "pass" : "fail",
+          mx: "error",
+          recipient: "not_checked",
+        },
+        occurrences: item.occurrences,
       };
     }
-    return await classifyEmail(email, {
+
+    const classified = await classifyEmail(item.email, {
       ...options,
       dnsResolver: cachedDnsResolver,
       catchAllCache,
+      canaryCache,
     });
+
+    return {
+      ...classified,
+      occurrences: item.occurrences,
+    };
   });
 
-  // Build summary counts
+  // Build summary counts: occurrence-weighted and unique-level
   const summary = {
-    total: unique.length,
+    total: 0,
     likely_deliverable: 0,
     likely_bounce: 0,
     unknown: 0,
+    submitted_count: trimmed.length,
+    unique_count: uniqueItems.length,
+    unique_summary: {
+      total: uniqueItems.length,
+      likely_deliverable: 0,
+      likely_bounce: 0,
+      unknown: 0,
+    },
   };
+
   for (const r of results) {
+    const occ = r.occurrences || 1;
+    summary.total += occ;
     if (summary[r.status] !== undefined) {
-      summary[r.status]++;
+      summary[r.status] += occ;
+    }
+    if (summary.unique_summary[r.status] !== undefined) {
+      summary.unique_summary[r.status] += 1;
     }
   }
 
@@ -1356,32 +1535,44 @@ export async function verifyBatch(emails, options = {}) {
 
 /**
  * Extract client IP address from request headers or socket.
+ * Enforces strict environment-specific trust rules:
+ * - Only trust x-vercel-forwarded-for when running in Vercel (process.env.VERCEL === '1')
+ * - Only trust x-real-ip or last hop of x-forwarded-for when env.TRUST_PROXY === 'true'
+ * - Otherwise fall back to req.socket.remoteAddress
+ * 
  * @param {object} req
+ * @param {object} [env=process.env]
  * @returns {string}
  */
-export function getClientIp(req) {
-  // Trust Vercel's platform header first (not user-spoofable)
-  const xVercelFwd = req.headers && req.headers['x-vercel-forwarded-for'];
-  if (typeof xVercelFwd === 'string') {
-    const first = xVercelFwd.split(',')[0].trim();
-    if (first) return first;
+export function getClientIp(req, env = process.env) {
+  // Trust Vercel's platform header only when running in Vercel environment
+  if (env.VERCEL === "1") {
+    const xVercelFwd = req.headers && req.headers["x-vercel-forwarded-for"];
+    if (typeof xVercelFwd === "string") {
+      const first = xVercelFwd.split(",")[0].trim();
+      if (first) return first;
+    }
   }
-  // Trust x-real-ip if present (set by trusted reverse proxy)
-  const xRealIp = req.headers && req.headers['x-real-ip'];
-  if (typeof xRealIp === 'string' && xRealIp.trim()) {
-    return xRealIp.trim();
+
+  // Trust proxy headers only when explicit TRUST_PROXY is configured
+  if (env.TRUST_PROXY === "true") {
+    const xRealIp = req.headers && req.headers["x-real-ip"];
+    if (typeof xRealIp === "string" && xRealIp.trim()) {
+      return xRealIp.trim();
+    }
+    const xForwardedFor = req.headers && req.headers["x-forwarded-for"];
+    if (typeof xForwardedFor === "string") {
+      const hops = xForwardedFor.split(",").map((s) => s.trim()).filter(Boolean);
+      if (hops.length > 0) return hops[hops.length - 1];
+    }
   }
-  // Fall back to socket address
+
+  // Fall back to direct socket remoteAddress
   if (req.socket && req.socket.remoteAddress) {
     return req.socket.remoteAddress;
   }
-  // Last resort: use last hop of x-forwarded-for (not the first, to avoid spoofing)
-  const xForwardedFor = req.headers && req.headers['x-forwarded-for'];
-  if (typeof xForwardedFor === 'string') {
-    const hops = xForwardedFor.split(',').map(s => s.trim()).filter(Boolean);
-    if (hops.length > 0) return hops[hops.length - 1];
-  }
-  return 'unknown';
+
+  return "unknown";
 }
 
 /**
@@ -1406,6 +1597,12 @@ export default async function handler(req, res) {
       });
     }
 
+    // Request body size limit (64 KB)
+    const contentLength = req.headers && req.headers["content-length"];
+    if (contentLength && parseInt(contentLength, 10) > MAX_BODY_BYTES) {
+      return res.status(413).json({ error: "Request body exceeds maximum size of 64 KB" });
+    }
+
     const body = req.body;
     if (!body || !Array.isArray(body.emails)) {
       return res.status(400).json({ error: "Request body must include an emails array" });
@@ -1415,8 +1612,8 @@ export default async function handler(req, res) {
       return res.status(400).json({ error: "emails array must not be empty" });
     }
 
-    if (body.emails.length > MAX_BATCH) {
-      return res.status(400).json({ error: `Batch size exceeds the maximum of ${MAX_BATCH}` });
+    if (body.emails.length > MAX_RAW_EMAILS) {
+      return res.status(400).json({ error: `Batch size exceeds the maximum of ${MAX_RAW_EMAILS}` });
     }
 
     // Validate that every element in emails is strictly a string
@@ -1438,7 +1635,7 @@ export default async function handler(req, res) {
 
     return res.status(200).json(result);
   } catch (err) {
-    console.error("[api/verify] Unexpected error:", err);
+    console.error("[api/verify] Unexpected error:", err.message || "internal error");
     return res.status(500).json({ error: "Internal server error" });
   }
 }

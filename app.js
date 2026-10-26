@@ -9,7 +9,7 @@ const CHUNK_SIZE = 50;
 const ANIMATE_FIRST_N = 30;
 const STAGGER_MS = 15;
 const API_URL = '/api/verify';
-const CLIENT_TIMEOUT_MS = 15000;
+const CLIENT_TIMEOUT_MS = 20000;
 
 const STATUS_LABELS = {
   likely_deliverable: { primary: 'LIKELY DELIVERABLE', secondary: 'CLEARED FOR DELIVERY', glyph: '✓', cssClass: 'stamp-likely_deliverable' },
@@ -45,30 +45,31 @@ let lastFailedChunks = [];
 let lastCounts = new Map();
 
 // --- DOM References ---
-const $textarea = document.getElementById('email-input');
-const $counter = document.getElementById('address-counter');
-const $validationNote = document.getElementById('validation-note');
-const $verifyBtn = document.getElementById('verify-btn');
-const $cancelBtn = document.getElementById('cancel-btn');
-const $cancelBtnCollapsed = document.getElementById('cancel-btn-collapsed');
-const $clearBtn = document.getElementById('clear-btn');
-const $sampleBtn = document.getElementById('sample-btn');
-const $intakeSlip = document.getElementById('intake-slip');
-const $intakeCollapsed = document.getElementById('intake-collapsed');
-const $intakeSummary = document.getElementById('intake-summary-text');
-const $editListBtn = document.getElementById('edit-list-btn');
-const $pigeonholes = document.getElementById('pigeonholes');
-const $progressStrip = document.getElementById('progress-strip');
-const $errorBanner = document.getElementById('error-banner');
-const $errorMessage = document.getElementById('error-message');
-const $retryBtn = document.getElementById('retry-btn');
-const $exportButtons = document.getElementById('export-buttons');
-const $csvBtn = document.getElementById('csv-btn');
-const $copyBtn = document.getElementById('copy-btn');
-const $ledgerWrap = document.getElementById('ledger-wrap');
-const $ledgerBody = document.getElementById('ledger-body');
-const $plainViewBtn = document.getElementById('plain-view-btn');
-const $resultsDivider = document.getElementById('results-divider');
+const isDom = typeof document !== 'undefined';
+const $textarea = isDom ? document.getElementById('email-input') : null;
+const $counter = isDom ? document.getElementById('address-counter') : null;
+const $validationNote = isDom ? document.getElementById('validation-note') : null;
+const $verifyBtn = isDom ? document.getElementById('verify-btn') : null;
+const $cancelBtn = isDom ? document.getElementById('cancel-btn') : null;
+const $cancelBtnCollapsed = isDom ? document.getElementById('cancel-btn-collapsed') : null;
+const $clearBtn = isDom ? document.getElementById('clear-btn') : null;
+const $sampleBtn = isDom ? document.getElementById('sample-btn') : null;
+const $intakeSlip = isDom ? document.getElementById('intake-slip') : null;
+const $intakeCollapsed = isDom ? document.getElementById('intake-collapsed') : null;
+const $intakeSummary = isDom ? document.getElementById('intake-summary-text') : null;
+const $editListBtn = isDom ? document.getElementById('edit-list-btn') : null;
+const $pigeonholes = isDom ? document.getElementById('pigeonholes') : null;
+const $progressStrip = isDom ? document.getElementById('progress-strip') : null;
+const $errorBanner = isDom ? document.getElementById('error-banner') : null;
+const $errorMessage = isDom ? document.getElementById('error-message') : null;
+const $retryBtn = isDom ? document.getElementById('retry-btn') : null;
+const $exportButtons = isDom ? document.getElementById('export-buttons') : null;
+const $csvBtn = isDom ? document.getElementById('csv-btn') : null;
+const $copyBtn = isDom ? document.getElementById('copy-btn') : null;
+const $ledgerWrap = isDom ? document.getElementById('ledger-wrap') : null;
+const $ledgerBody = isDom ? document.getElementById('ledger-body') : null;
+const $plainViewBtn = isDom ? document.getElementById('plain-view-btn') : null;
+const $resultsDivider = isDom ? document.getElementById('results-divider') : null;
 
 // --- Init ---
 function init() {
@@ -169,8 +170,9 @@ function stampRotationClass(email) {
 
 /**
  * Normalize an email address: trim, preserve local-part case, lowercase domain only.
+ * Alice@Example.COM -> Alice@example.com
  */
-function normalizeEmailAddress(raw) {
+export function normalizeEmailAddress(raw) {
   if (typeof raw !== 'string') return String(raw);
   const trimmed = raw.trim();
   const atIdx = trimmed.lastIndexOf('@');
@@ -181,19 +183,27 @@ function normalizeEmailAddress(raw) {
 }
 
 /**
- * Deduplicate addresses. Uses normalizeEmailAddress for case-insensitive domain,
- * preserving original local-part case. Two addresses with same normalized form are duplicates.
+ * Deduplication key for email addresses: case-insensitive normalized address.
+ * Alice@Example.COM -> alice@example.com
  */
-function deduplicateAddresses(lines) {
+export function getDedupeKey(raw) {
+  return normalizeEmailAddress(raw).toLowerCase();
+}
+
+/**
+ * Deduplicate addresses. Uses getDedupeKey (toLowerCase) for case-insensitive deduplication,
+ * preserving original first-seen display string and counting occurrences.
+ */
+export function deduplicateAddresses(lines) {
   const counts = new Map();
   const unique = [];
   for (const line of lines) {
     const normalized = normalizeEmailAddress(line);
-    const lower = normalized.toLowerCase();
-    if (counts.has(lower)) {
-      counts.set(lower, counts.get(lower) + 1);
+    const key = getDedupeKey(line);
+    if (counts.has(key)) {
+      counts.set(key, counts.get(key) + 1);
     } else {
-      counts.set(lower, 1);
+      counts.set(key, 1);
       unique.push(normalized);
     }
   }
@@ -210,36 +220,48 @@ function handleCancel() {
   currentSessionId++;
   isVerifying = false;
   setVerifyingUI(false);
-  $progressStrip.textContent = 'Sorting cancelled';
+  if ($progressStrip) $progressStrip.textContent = 'Sorting cancelled';
 }
 
 function setVerifyingUI(verifying) {
   if (verifying) {
-    $verifyBtn.textContent = 'Sorting…';
-    $verifyBtn.disabled = true;
+    if ($verifyBtn) {
+      $verifyBtn.textContent = 'Sorting…';
+      $verifyBtn.disabled = true;
+    }
     if ($cancelBtn) $cancelBtn.hidden = false;
     if ($cancelBtnCollapsed) $cancelBtnCollapsed.hidden = false;
   } else {
-    $verifyBtn.textContent = 'Verify';
-    $verifyBtn.disabled = false;
+    if ($verifyBtn) {
+      $verifyBtn.textContent = 'Verify';
+      $verifyBtn.disabled = false;
+    }
     if ($cancelBtn) $cancelBtn.hidden = true;
     if ($cancelBtnCollapsed) $cancelBtnCollapsed.hidden = true;
   }
 }
 
 // --- Client-Side Syntax Check for Fallback Rows ---
-function checkClientSyntax(email) {
+/**
+ * Validate email syntax with RFC 5321 length limits and UTF-8 octet counts.
+ */
+export function checkClientSyntax(email) {
   if (typeof email !== 'string') return false;
   const trimmed = email.trim();
-  if (!trimmed || trimmed.length > 254 || /\s/.test(trimmed)) return false;
+  const encoder = new TextEncoder();
+  const totalBytes = encoder.encode(trimmed).length;
+  if (!trimmed || totalBytes > 254 || /\s/.test(trimmed)) return false;
   const parts = trimmed.split('@');
   if (parts.length !== 2) return false;
   const [local, domain] = parts;
-  if (!local || !domain || local.length > 64) return false;
+  if (!local || !domain) return false;
+  const localBytes = encoder.encode(local).length;
+  if (localBytes < 1 || localBytes > 64) return false;
   const labels = domain.split('.');
   if (labels.length < 2) return false;
   for (const l of labels) {
-    if (!l || l.startsWith('-') || l.endsWith('-')) return false;
+    const lBytes = encoder.encode(l).length;
+    if (!l || lBytes < 1 || lBytes > 63 || l.startsWith('-') || l.endsWith('-')) return false;
   }
   return true;
 }
@@ -248,12 +270,12 @@ function upsertChunkResults(results, counts) {
   for (let i = 0; i < results.length; i++) {
     const result = results[i];
     const normalized = normalizeEmailAddress(result.email);
-    const lowerEmail = normalized.toLowerCase();
-    const count = counts.get(lowerEmail) || result.count || result.occurrences || 1;
+    const key = getDedupeKey(result.email);
+    const count = counts.get(key) || result.count || result.occurrences || 1;
     const fullResult = { ...result, email: normalized, count, occurrences: count };
 
     // Update or insert into allResults
-    const existingIdx = allResults.findIndex(r => normalizeEmailAddress(r.email).toLowerCase() === lowerEmail);
+    const existingIdx = allResults.findIndex(r => getDedupeKey(r.email) === key);
     if (existingIdx !== -1) {
       allResults[existingIdx] = fullResult;
     } else {
@@ -261,22 +283,24 @@ function upsertChunkResults(results, counts) {
     }
 
     // Update or insert into DOM
-    const existingRow = $ledgerBody.querySelector(`tr[data-email="${CSS.escape(normalized)}"]`);
-    const newRow = createResultRow(fullResult, 1, count);
+    if ($ledgerBody) {
+      const existingRow = $ledgerBody.querySelector(`tr[data-email="${CSS.escape(normalized)}"]`);
+      const newRow = createResultRow(fullResult, 1, count);
 
-    // Stagger animation for initial items using CSS classes (no inline style)
-    if (i < ANIMATE_FIRST_N) {
-      const stamp = newRow.querySelector('.stamp');
-      if (stamp) {
-        stamp.classList.add('stamp-animate');
-        stamp.classList.add(`stagger-${i}`);
+      // Stagger animation for initial items using CSS classes (no inline style)
+      if (i < ANIMATE_FIRST_N) {
+        const stamp = newRow.querySelector('.stamp');
+        if (stamp) {
+          stamp.classList.add('stamp-animate');
+          stamp.classList.add(`stagger-${i}`);
+        }
       }
-    }
 
-    if (existingRow) {
-      existingRow.replaceWith(newRow);
-    } else {
-      $ledgerBody.appendChild(newRow);
+      if (existingRow) {
+        existingRow.replaceWith(newRow);
+      } else {
+        $ledgerBody.appendChild(newRow);
+      }
     }
   }
 
@@ -366,7 +390,11 @@ async function handleVerify(isRetry = false) {
 
       const controller = new AbortController();
       activeAbortController = controller;
-      const timeoutId = setTimeout(() => controller.abort(new Error('timeout')), CLIENT_TIMEOUT_MS);
+      let timedOut = false;
+      const timeoutId = setTimeout(() => {
+        timedOut = true;
+        controller.abort();
+      }, CLIENT_TIMEOUT_MS);
 
       try {
         const response = await fetch(API_URL, {
@@ -392,7 +420,7 @@ async function handleVerify(isRetry = false) {
         if (sessionId !== currentSessionId) return;
 
         hasFailure = true;
-        failureReason = err.name === 'AbortError' ? 'The request timed out.' : (err.message || 'Network error');
+        failureReason = timedOut ? 'The request timed out.' : (err.name === 'AbortError' ? 'The request timed out.' : (err.message || 'Network error'));
         lastFailedChunks.push(chunk);
 
         // Render placeholder rows marked as unknown with client-side syntax check
@@ -750,14 +778,21 @@ function handleExportCSV() {
 
 /**
  * Sanitize cell values against OWASP CSV formula injection.
- * If value starts with =, +, -, @, tab, or carriage return, prefix with single quote.
+ * Strips/replaces embedded newlines with space, and prefixes ASCII/full-width formula triggers
+ * with single quote.
+ * @param {any} val
+ * @returns {string}
  */
-function csvSanitize(val) {
+export function csvSanitize(val) {
   let str = String(val ?? '');
-  if (/^\s*[=+\-@\t\r]/.test(str)) {
+  // Replace internal newlines with space to prevent row corruption
+  str = str.replace(/\r\n|\r|\n/g, ' ');
+  // Prefix formula triggers (ASCII + full-width Unicode) with single quote
+  if (/^[ \t\r\n]*[=+\-@\t\r\n|%\uFF1D\uFF0B\uFF0D\uFF20\u2212\uFE62\uFE63\uFE66]/.test(str)) {
     str = "'" + str;
   }
-  if (str.includes(',') || str.includes('"') || str.includes('\n') || str.includes('\r')) {
+  // CSV RFC 4180 quoting
+  if (str.includes(',') || str.includes('"')) {
     return `"${str.replace(/"/g, '""')}"`;
   }
   return str;
@@ -816,4 +851,6 @@ function handlePlainViewToggle() {
 }
 
 // --- Run ---
-init();
+if (typeof window !== 'undefined' && typeof document !== 'undefined') {
+  init();
+}

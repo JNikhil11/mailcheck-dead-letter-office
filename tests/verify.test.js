@@ -1,6 +1,7 @@
 import { describe, it, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import fs from "node:fs";
 import handler, {
   checkSyntax,
   checkMx,
@@ -12,8 +13,10 @@ import handler, {
   checkRateLimit,
   resetRateLimits,
   normalizeEmailAddress,
+  getDedupeKey,
   getClientIp,
 } from "../api/verify.js";
+import { csvSanitize } from "../app.js";
 
 // ---------------------------------------------------------------------------
 // Helpers — Mock DNS Resolvers
@@ -27,19 +30,28 @@ function mxFoundResolver(exchange = "mx.example.com") {
   };
 }
 
-function nxdomainResolver() {
+function nxdomainResolver(allowGmail = true) {
   return {
-    resolveMx: async () => {
+    resolveMx: async (domain) => {
+      if (allowGmail && domain === "gmail.com") {
+        return [{ exchange: "gmail-smtp-in.l.google.com", priority: 5 }];
+      }
       const err = new Error("queryMx ENOTFOUND");
       err.code = "ENOTFOUND";
       throw err;
     },
-    resolve4: async () => {
+    resolve4: async (domain) => {
+      if (allowGmail && domain === "gmail.com") {
+        return ["142.250.185.26"];
+      }
       const err = new Error("ENOTFOUND");
       err.code = "ENOTFOUND";
       throw err;
     },
-    resolve6: async () => {
+    resolve6: async (domain) => {
+      if (allowGmail && domain === "gmail.com") {
+        return ["2607:f8b0:4004:c07::1a"];
+      }
       const err = new Error("ENOTFOUND");
       err.code = "ENOTFOUND";
       throw err;
@@ -249,6 +261,25 @@ describe("MailCheck — Verification & Security Test Suite", () => {
       assert.equal(result.checks.mx, "error");
       assert.equal(result.reason, "The check timed out, so the result is inconclusive");
     });
+
+    it("returns unknown (mx: error) on broken sandbox resolver where all domains including gmail.com return ENOTFOUND", async () => {
+      const brokenResolver = nxdomainResolver(false); // does not resolve gmail.com
+      const result = await classifyEmail("alice@gmail.com", {
+        dnsResolver: brokenResolver,
+        enableSmtp: false,
+      });
+      assert.equal(result.status, "unknown");
+      assert.equal(result.checks.mx, "error");
+      assert.match(result.reason, /temporary resolver error/i);
+
+      // Verify that nonexistent domain also returns unknown instead of falsely marking likely_bounce
+      const result2 = await classifyEmail("nobody@nonexistent-domain.xyz", {
+        dnsResolver: brokenResolver,
+        enableSmtp: false,
+      });
+      assert.equal(result2.status, "unknown");
+      assert.equal(result2.checks.mx, "error");
+    });
   });
 
   // 4. RFC 5321 Parallel A / AAAA Fallback
@@ -287,7 +318,10 @@ describe("MailCheck — Verification & Security Test Suite", () => {
 
     it("returns mx: none when resolveMx is ENODATA and both A and AAAA return empty/ENODATA", async () => {
       const resolver = {
-        resolveMx: async () => {
+        resolveMx: async (domain) => {
+          if (domain === "gmail.com") {
+            return [{ exchange: "gmail-smtp-in.l.google.com", priority: 5 }];
+          }
           const err = new Error("ENODATA");
           err.code = "ENODATA";
           throw err;
@@ -558,14 +592,14 @@ describe("MailCheck — Verification & Security Test Suite", () => {
 
   // 9. Batch Size Limits & Deduplication
   describe("9 — Batch size limit & case-insensitive deduplication", () => {
-    it("rejects batches with more than 100 emails", async () => {
+    it("rejects batches with more than 100 unique emails", async () => {
       const emails = Array.from({ length: 101 }, (_, i) => `user${i}@example.com`);
       const result = await verifyBatch(emails);
       assert.ok(result.error);
       assert.match(result.error, /maximum/i);
     });
 
-    it("accepts batches with exactly 100 emails", async () => {
+    it("accepts batches with exactly 100 unique emails", async () => {
       const emails = Array.from({ length: 100 }, (_, i) => `user${i}@example.com`);
       const result = await verifyBatch(emails, {
         dnsResolver: mxFoundResolver(),
@@ -574,9 +608,33 @@ describe("MailCheck — Verification & Security Test Suite", () => {
       assert.ok(!result.error);
       assert.equal(result.results.length, 100);
       assert.equal(result.summary.total, 100);
+      assert.equal(result.summary.unique_count, 100);
     });
 
-    it("deduplicates case-insensitively (Bob@Example.org and bob@example.org)", async () => {
+    it("accepts 101 identical raw addresses by deduplicating to 1 unique address with 101 occurrences", async () => {
+      const emails = Array.from({ length: 101 }, () => "alice@gmail.com");
+      const result = await verifyBatch(emails, {
+        dnsResolver: mxFoundResolver(),
+        enableSmtp: false,
+      });
+      assert.ok(!result.error);
+      assert.equal(result.results.length, 1);
+      assert.equal(result.results[0].email, "alice@gmail.com");
+      assert.equal(result.results[0].occurrences, 101);
+      assert.equal(result.summary.total, 101);
+      assert.equal(result.summary.submitted_count, 101);
+      assert.equal(result.summary.unique_count, 1);
+      assert.equal(result.summary.unique_summary.total, 1);
+    });
+
+    it("rejects raw payloads exceeding MAX_RAW_EMAILS (1,000)", async () => {
+      const emails = Array.from({ length: 1001 }, () => "alice@gmail.com");
+      const result = await verifyBatch(emails);
+      assert.ok(result.error);
+      assert.match(result.error, /1000/);
+    });
+
+    it("deduplicates case-insensitively preserving first-seen casing (Bob@Example.org and bob@example.org)", async () => {
       const emails = ["Bob@Example.org", "bob@example.org", "BOB@EXAMPLE.ORG", "alice@example.org"];
       const result = await verifyBatch(emails, {
         dnsResolver: mxFoundResolver(),
@@ -584,7 +642,14 @@ describe("MailCheck — Verification & Security Test Suite", () => {
       });
       assert.ok(!result.error);
       assert.equal(result.results.length, 2);
-      assert.equal(result.summary.total, 2);
+      assert.equal(result.results[0].email, "Bob@example.org");
+      assert.equal(result.results[0].occurrences, 3);
+      assert.equal(result.results[1].email, "alice@example.org");
+      assert.equal(result.results[1].occurrences, 1);
+      assert.equal(result.summary.total, 4);
+      assert.equal(result.summary.submitted_count, 4);
+      assert.equal(result.summary.unique_count, 2);
+      assert.equal(result.summary.unique_summary.total, 2);
     });
   });
 
@@ -669,7 +734,7 @@ describe("MailCheck — Verification & Security Test Suite", () => {
       const req = {
         method: "POST",
         body: { emails: ["user@example.com"] },
-        headers: { "x-forwarded-for": ip },
+        socket: { remoteAddress: ip },
       };
       const res = createMockRes();
 
@@ -804,9 +869,9 @@ describe("MailCheck — Verification & Security Test Suite", () => {
     });
   });
 
-  // 16 — Trusted IP header ordering (x-vercel-forwarded-for beats x-forwarded-for)
+  // 16 — Trusted IP header ordering
   describe("16 — IP header trust order for rate limiting", () => {
-    it("prefers x-vercel-forwarded-for over x-forwarded-for", () => {
+    it("prefers x-vercel-forwarded-for over x-forwarded-for when running in Vercel", () => {
       const req = {
         headers: {
           "x-vercel-forwarded-for": "1.2.3.4",
@@ -814,11 +879,11 @@ describe("MailCheck — Verification & Security Test Suite", () => {
         },
         socket: { remoteAddress: "127.0.0.1" },
       };
-      const ip = getClientIp(req);
+      const ip = getClientIp(req, { VERCEL: "1" });
       assert.equal(ip, "1.2.3.4");
     });
 
-    it("falls back to x-real-ip when x-vercel-forwarded-for is absent", () => {
+    it("falls back to x-real-ip when TRUST_PROXY is true", () => {
       const req = {
         headers: {
           "x-real-ip": "5.6.7.8",
@@ -826,7 +891,7 @@ describe("MailCheck — Verification & Security Test Suite", () => {
         },
         socket: { remoteAddress: "127.0.0.1" },
       };
-      const ip = getClientIp(req);
+      const ip = getClientIp(req, { TRUST_PROXY: "true" });
       assert.equal(ip, "5.6.7.8");
     });
 
@@ -839,14 +904,226 @@ describe("MailCheck — Verification & Security Test Suite", () => {
       assert.equal(ip, "10.0.0.1");
     });
 
-    it("uses last hop of x-forwarded-for (not first) as final fallback", () => {
+    it("uses last hop of x-forwarded-for (not first) when TRUST_PROXY is true", () => {
       const req = {
         headers: {
           "x-forwarded-for": "9.9.9.9, 8.8.8.8, 7.7.7.7",
         },
       };
-      const ip = getClientIp(req);
+      const ip = getClientIp(req, { TRUST_PROXY: "true" });
       assert.equal(ip, "7.7.7.7");
+    });
+
+    it("ignores x-forwarded-for and x-vercel-forwarded-for when neither VERCEL nor TRUST_PROXY is set", () => {
+      const req = {
+        headers: {
+          "x-vercel-forwarded-for": "1.2.3.4",
+          "x-forwarded-for": "7.7.7.7",
+        },
+        socket: { remoteAddress: "10.0.0.2" },
+      };
+      const ip = getClientIp(req, {});
+      assert.equal(ip, "10.0.0.2");
+    });
+  });
+
+  // 17 — UTF-8 byte boundary tests (Finding 4)
+  describe("17 — UTF-8 byte-accurate length limits", () => {
+    it("accepts 32 two-byte UTF-8 characters in local-part (64 UTF-8 bytes)", () => {
+      const local = "ü".repeat(32);
+      assert.equal(local.length, 32);
+      assert.equal(Buffer.byteLength(local, "utf8"), 64);
+      const res = checkSyntax(`${local}@example.com`);
+      assert.equal(res.valid, true);
+    });
+
+    it("rejects 33 two-byte UTF-8 characters in local-part (66 UTF-8 bytes) as likely_bounce", async () => {
+      const local = "ü".repeat(33);
+      assert.equal(local.length, 33);
+      assert.equal(Buffer.byteLength(local, "utf8"), 66);
+      const res = checkSyntax(`${local}@example.com`);
+      assert.equal(res.valid, false);
+
+      const classified = await classifyEmail(`${local}@example.com`);
+      assert.equal(classified.status, "likely_bounce");
+      assert.equal(classified.reason, "Invalid email format");
+    });
+
+    it("rejects internationalized domain whose Punycode expansion exceeds 253 octets", () => {
+      // Create a domain with unicode labels that expand past 253 punycode bytes
+      const longLabel = "ümläüt".repeat(12); // repeats punycode prefix and octets
+      const res = checkSyntax(`user@${longLabel}.${longLabel}.${longLabel}.com`);
+      assert.equal(res.valid, false);
+    });
+  });
+
+  // 18 — Single-flight catch-all detection (Finding 8)
+  describe("18 — Single-flight promise coalescing for SMTP catch-all detection", () => {
+    it("5 concurrent queries on same domain trigger exactly 1 catch-all probe", async () => {
+      let catchAllProbeCount = 0;
+      let realProbeCount = 0;
+
+      const socketFactory = () =>
+        createMockSmtpSocket((peer) => {
+          peer.write("220 mx.example.com ESMTP\r\n");
+          peer.on("data", (chunk) => {
+            const str = chunk.toString();
+            if (str.startsWith("EHLO")) peer.write("250-mx.example.com\r\n250 HELP\r\n");
+            else if (str.startsWith("MAIL FROM")) peer.write("250 2.1.0 Ok\r\n");
+            else if (str.startsWith("RCPT TO:<nonexistent-probe")) {
+              catchAllProbeCount++;
+              // Simulate small delay then reject random probe
+              setTimeout(() => peer.write("550 5.1.1 User unknown\r\n"), 10);
+            } else if (str.startsWith("RCPT TO:<user")) {
+              realProbeCount++;
+              peer.write("250 2.1.5 Recipient Ok\r\n");
+            } else if (str.startsWith("QUIT")) {
+              peer.end("221 Bye\r\n");
+            }
+          });
+        });
+
+      const catchAllCache = new Map();
+      const promises = [1, 2, 3, 4, 5].map((i) =>
+        probeSmtpRecipient(`user${i}@shared-domain.com`, "mx.example.com", {
+          socketFactory,
+          catchAllCache,
+          timeout: 2000,
+        })
+      );
+
+      const results = await Promise.all(promises);
+      assert.equal(results.length, 5);
+      // All 5 should resolve with accepted / likely_deliverable
+      results.forEach((r) => {
+        assert.equal(r.recipient, "accepted");
+        assert.equal(r.status, "likely_deliverable");
+      });
+      // Exactly ONE catch-all random address probe should have been transmitted!
+      assert.equal(catchAllProbeCount, 1);
+    });
+  });
+
+  // 19 — SSRF & HTTPS validation on EMAIL_VERIFICATION_API_URL (Finding 9)
+  describe("19 — HTTPS protocol & SSRF validation on EMAIL_VERIFICATION_API_URL", () => {
+    it("rejects http:// API URL immediately without calling fetch", async () => {
+      let fetchCalled = false;
+      const fetchFn = async () => {
+        fetchCalled = true;
+        return { ok: true, json: async () => ({ state: "deliverable" }) };
+      };
+
+      const result = await checkRecipientViaHttps("alice@example.com", {
+        apiKey: "test-key-123",
+        apiUrl: "http://api.insecure.com/v1/verify",
+        fetchFn,
+      });
+
+      assert.deepEqual(result, { fallback: true });
+      assert.equal(fetchCalled, false);
+    });
+
+    it("rejects localhost, .local, and private IP literals", async () => {
+      let fetchCalled = false;
+      const fetchFn = async () => {
+        fetchCalled = true;
+        return { ok: true, json: async () => ({ state: "deliverable" }) };
+      };
+
+      const blockedUrls = [
+        "https://localhost:8443/verify",
+        "https://service.local/verify",
+        "https://127.0.0.1:8443/verify",
+        "https://192.168.1.10/verify",
+        "https://10.0.0.5/verify",
+        "https://[::1]/verify",
+      ];
+
+      for (const url of blockedUrls) {
+        fetchCalled = false;
+        const res = await checkRecipientViaHttps("alice@example.com", {
+          apiKey: "test-key-123",
+          apiUrl: url,
+          fetchFn,
+        });
+        assert.deepEqual(res, { fallback: true });
+        assert.equal(fetchCalled, false, `Expected ${url} to be blocked`);
+      }
+    });
+
+    it("allows legitimate public HTTPS endpoints and transmits Bearer authorization", async () => {
+      let capturedHeaders = null;
+      const fetchFn = async (url, opts) => {
+        capturedHeaders = opts.headers;
+        return { ok: true, json: async () => ({ state: "deliverable" }) };
+      };
+
+      const res = await checkRecipientViaHttps("alice@example.com", {
+        apiKey: "sec-key-xyz",
+        apiUrl: "https://api.hunter.io/v2/email-verifier",
+        fetchFn,
+      });
+
+      assert.equal(res.status, "likely_deliverable");
+      assert.equal(capturedHeaders.Authorization, "Bearer sec-key-xyz");
+    });
+  });
+
+  // 20 — Zero inline styles in index.html & app.js (Finding 7)
+  describe("20 — Zero inline style attributes and DOM style assignments", () => {
+    it("index.html contains zero inline style attributes", () => {
+      const html = fs.readFileSync("index.html", "utf8");
+      const matches = html.match(/style\s*=/gi);
+      assert.equal(matches, null, `Found inline style attributes in index.html: ${matches}`);
+    });
+
+    it("app.js contains zero .style. DOM style mutations", () => {
+      const js = fs.readFileSync("app.js", "utf8");
+      const matches = js.match(/\.style\s*(\.|\[|=)/g);
+      assert.equal(matches, null, `Found .style assignments in app.js: ${matches}`);
+    });
+
+    it("styles.css defines .svg-defs with position: absolute, 0 size, overflow hidden and pointer-events none", () => {
+      const css = fs.readFileSync("styles.css", "utf8");
+      assert.match(css, /\.svg-defs\s*\{[^}]*position:\s*absolute/);
+      assert.match(css, /\.svg-defs\s*\{[^}]*overflow:\s*hidden/);
+      assert.match(css, /\.svg-defs\s*\{[^}]*pointer-events:\s*none/);
+    });
+  });
+
+  // 21 — Hardened CSV Formula Sanitization (Finding 10)
+  describe("21 — Hardened CSV sanitization with Unicode & embedded newlines", () => {
+    it("prefixes ASCII formula injection triggers with single quote", () => {
+      assert.equal(csvSanitize("=1+1"), "'=1+1");
+      assert.equal(csvSanitize("+123"), "'+123");
+      assert.equal(csvSanitize("-456"), "'-456");
+      assert.equal(csvSanitize("@SUM(A1)"), "'@SUM(A1)");
+      assert.equal(csvSanitize("|cmd.exe"), "'|cmd.exe");
+      assert.equal(csvSanitize("%PROGRAMFILES%"), "'%PROGRAMFILES%");
+      assert.equal(csvSanitize("\t=123"), "'\t=123");
+    });
+
+    it("prefixes full-width Unicode formula injection triggers with single quote", () => {
+      assert.equal(csvSanitize("\uFF1DSUM(A1)"), "'\uFF1DSUM(A1)"); // ＝
+      assert.equal(csvSanitize("\uFF0B123"), "'\uFF0B123");         // ＋
+      assert.equal(csvSanitize("\uFF0D456"), "'\uFF0D456");         // －
+      assert.equal(csvSanitize("\uFF20SUM(A1)"), "'\uFF20SUM(A1)"); // ＠
+      assert.equal(csvSanitize("\u2212cmd"), "'\u2212cmd");         // −
+      assert.equal(csvSanitize("\uFE62123"), "'\uFE62123");         // ﹢
+      assert.equal(csvSanitize("\uFE63456"), "'\uFE63456");         // ﹣
+      assert.equal(csvSanitize("\uFE66calc"), "'\uFE66calc");       // ﹦
+    });
+
+    it("replaces embedded newlines with space to preserve row boundaries", () => {
+      const input = "multi\r\nline\nvalue\rtest";
+      const sanitized = csvSanitize(input);
+      assert.ok(!sanitized.includes("\n"));
+      assert.ok(!sanitized.includes("\r"));
+      assert.equal(sanitized, "multi line value test");
+    });
+
+    it("properly quotes cells containing commas or double quotes", () => {
+      assert.equal(csvSanitize('value with "quotes" and, commas'), '"value with ""quotes"" and, commas"');
     });
   });
 });

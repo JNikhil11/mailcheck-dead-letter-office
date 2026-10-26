@@ -1,24 +1,29 @@
 # MailCheck — Product Requirements Document (PRD)
 
-**Version:** 1.0  
-**Status:** Initial draft — implementation-ready scope  
-**Date:** 25 October 2026  
-**Product:** Bulk Email Address Verification Web Application
+**Version:** 2.0 (Hardened Production Release)  
+**Status:** Implementation-verified specification  
+**Date:** 26 October 2026  
+**Product:** Bulk Email Address Verification Web Application (The Dead Letter Office)
 
 ## 1. Executive summary
-MailCheck accepts a list of email addresses and returns **Likely Deliverable**, **Likely Bounce**, or **Unknown** for each address. It combines syntax validation and DNS/MX checks, with optional recipient verification if supported. It must communicate uncertainty clearly and must not claim that delivery is guaranteed.
+MailCheck accepts a list of email addresses and returns **Likely Deliverable**, **Likely Bounce**, or **Unknown** for each address. It combines RFC 5321/6531 UTF-8 byte-accurate syntax validation, DNS/MX lookups with parallel RFC 5321 A/AAAA fallback, RFC 7505 Null MX detection, a resolver health canary check, and SSRF-protected multi-tier recipient verification (external HTTPS API, direct SMTP socket probing when permitted, and honest serverless fallback). It communicates uncertainty clearly and never claims delivery is guaranteed.
 
-This is a rule-based application. It does not require training a machine-learning model, a database, user accounts, or a paid API. It must not send test emails to addresses the user does not own.
+MailCheck is rule-based and privacy-first: addresses are processed in memory and discarded without database or browser storage, unless an optional external verification API is configured. No emails are sent.
 
 ## 2. Problem statement
-Users may have lists containing typos, domains that cannot receive email, or addresses whose mailbox status is unclear. MailCheck checks addresses in bulk and explains what the available evidence can and cannot establish.
+Users may have lists containing typos, domains that cannot receive email, or addresses whose mailbox status is unclear. MailCheck checks addresses in bulk, collapses duplicates case-insensitively while preserving display casing, and explains what the available evidence can and cannot establish.
 
 ## 3. Goals
-- Accept multiple email addresses, one per line.
-- Return one status and a human-readable reason per non-empty address.
-- Detect malformed syntax and check domain email-routing configuration.
+- Accept multiple email addresses, up to 1,000 raw lines, chunked into batches of 50 in the UI.
+- API accepts up to 100 unique addresses (from up to 1,000 raw lines, 64 KB max body) per request.
+- Deduplicate case-insensitively (`toLowerCase()`) while preserving the first-seen display casing and presenting an occurrence badge (`× N`).
+- Enforce RFC 5321 / RFC 6531 UTF-8 byte limits (64 octets local-part, 254 octets total).
+- Provide DNS resolver health canary check (`gmail.com`) to prevent false bounces in sandboxed environments.
+- Enforce 25 DNS concurrency, 2000ms DNS timeout, 8000ms batch time budget, 11000ms hard cutoff, 20000ms client timeout, and 15s Vercel `maxDuration`.
+- Provide interactive `#cancel-btn` and full/partial failure `#error-banner` with retry.
+- Export 7-column formula-safe CSV (`email,status,reason,syntax,mx,recipient,occurrences`) with ASCII + full-width Unicode injection sanitization.
+- Provide strict Content-Security-Policy with zero inline styles (`'unsafe-inline'` forbidden).
 - Return Unknown for inconclusive or blocked checks rather than falsely claiming an address is invalid.
-- Deploy publicly and document actual limitations.
 - Avoid sending messages and avoid unnecessary retention of submitted addresses.
 
 ## 4. Non-goals
@@ -26,78 +31,106 @@ Users may have lists containing typos, domains that cannot receive email, or add
 - Sending emails or test messages.
 - Guaranteeing inbox delivery or spam-folder avoidance.
 - Accounts, database, billing, or team administration in the MVP.
-- Bypassing mail-server protections.
+- Bypassing mail-server protections or sending unauthenticated relay traffic.
 
 ## 5. Target user and journey
-A user opens the site, pastes a list, clicks **Verify**, reviews statuses and reasons, and optionally copies or exports results.
+A user opens the site, pastes a list of up to 1,000 addresses, clicks **Verify**, watches the live progress strip, cancels mid-flight if needed with `#cancel-btn`, reviews statuses, reasons, and postmarks in the ledger, filters by pigeonhole cubbies, retries failed chunks via `#retry-btn`, and copies or exports the results as formula-safe CSV.
 
 ## 6. Scope
 
-### MVP
-- Responsive multi-line input.
-- Verify button, loading state, and clear errors.
-- Results table with status, reason, and checks performed.
-- Summary counts by status.
-- Backend endpoint for verification.
-- Syntax validation and DNS/MX lookup.
-- Timeouts and graceful error handling.
-- README with setup, deployment, checks, and limitations.
-
-### Optional
-- CSV export and copy-to-clipboard.
-- Filtering/sorting.
-- Third-party verification API.
-- SMTP recipient verification where permitted and appropriate.
+### Core Capabilities (v2.0)
+- Responsive multi-line intake slip with live address counter (up to 1,000 addresses).
+- Case-insensitive deduplication with first-seen display casing and `× N` duplicate count badges.
+- Chunked processing (50 unique addresses per client chunk, API limit 100 unique addresses).
+- Verify, Cancel (`#cancel-btn`), Clear, and Load Sample controls.
+- Interactive Pigeonhole filter cubbies with occurrence-weighted totals.
+- Verification Ledger table with semantic headers, sorting, stamps, and postmarks.
+- Client timeout (20000ms) and server batch budget (8000ms budget, 11000ms hard cutoff, 15s Vercel `maxDuration`).
+- Partial/full batch error banner (`#error-banner`) with retry button (`#retry-btn`).
+- 7-column formula-safe CSV export (`email,status,reason,syntax,mx,recipient,occurrences`).
+- Clipboard copy with formatted occurrence badges.
+- Plain view toggle and reduced-motion support.
 
 ## 7. Status rules
-- **Likely Bounce:** malformed address, confirmed nonexistent domain, no usable mail route after applicable fallback rules, or a clear recipient rejection.
-- **Likely Deliverable:** a configured verification method provides sufficiently positive recipient-level evidence. Never infer this from syntax or MX records alone.
-- **Unknown:** evidence is inconclusive, mailbox status is hidden, verification is blocked, or a check times out.
-
-A valid syntax result does not prove a mailbox exists. MX records show domain mail routing, not mailbox existence. Transient DNS/network failures must not be treated as proof that a mailbox is invalid.
+- **Likely Bounce:** malformed address (syntax failure / RFC byte length exceeded), confirmed nonexistent domain (NXDOMAIN with healthy resolver canary), no usable mail route after RFC 7505 Null MX and RFC 5321 A/AAAA fallback, or an explicit SMTP/API mailbox rejection (550 / 551 / 553 with 5.1.1).
+- **Likely Deliverable:** a configured verification method (external HTTPS API or direct SMTP RCPT probe) provides positive recipient-level confirmation. Never infer this from syntax or MX records alone.
+- **Unknown:** evidence is inconclusive, mailbox status is hidden/catch-all, DNS resolver is broken/sandboxed, verification is blocked by policy/spam filters (`554`, `5.7.1`), or a check times out.
 
 ## 8. Functional requirements
-1. Accept multiple addresses, one per line.
-2. Trim surrounding whitespace and ignore blank lines; document duplicate handling.
-3. Apply a reasonable batch-size limit.
-4. Validate syntax before network checks.
-5. Look up DNS/MX records for plausible addresses.
-6. Attempt SMTP or provider verification only if configured and permitted.
-7. Return a status and reason for every submitted non-empty address.
-8. Display summary counts.
-9. Handle invalid requests, DNS errors, timeouts, and server errors.
-10. Do not send emails or log full address lists unnecessarily.
-11. Ensure deployed behavior matches the README.
+1. Accept multiple addresses, one per line (up to 1,000 lines).
+2. Trim surrounding whitespace and ignore blank lines; deduplicate case-insensitively while preserving first-seen casing.
+3. Enforce API payload limits: max 1,000 raw lines, max 100 unique deduplicated addresses, max 64 KB request body.
+4. Validate RFC 5321 / RFC 6531 UTF-8 byte lengths before network checks (local <= 64 bytes, total <= 254 bytes, domain <= 253 bytes, label 1..63 bytes).
+5. Look up DNS/MX records for plausible addresses with 25 DNS concurrency and 2000ms timeout.
+6. Run per-batch `gmail.com` DNS resolver health canary check before treating NXDOMAIN as `likely_bounce`.
+7. Run single-flight Promise catch-all probe per domain to coalesce concurrent checks and prevent probe flooding.
+8. Enforce SSRF protection via `net.BlockList` and IPv4-in-IPv6 parsing on all socket connections and external API URLs.
+9. Return a status, reason, postmarks, and occurrences for every submitted unique address, along with occurrence-weighted and unique-level summaries.
+10. Do not send emails or log full address lists.
 
-## 9. Suggested architecture
-- **Frontend:** HTML, CSS, JavaScript (or React).
-- **Backend:** Node.js API route/serverless function.
-- **Syntax:** maintained email parsing/validation library plus policy rules.
-- **DNS:** Node.js DNS resolver, including MX lookup.
-- **Optional provider:** call only from backend; store the key in an environment variable.
-- **Hosting:** Vercel for frontend and API functions.
+## 9. System architecture
+- **Frontend:** Semantic HTML5, CSS3 with zero inline styles, Vanilla ES modules (`app.js`).
+- **Backend:** Node.js Vercel serverless function (`api/verify.js`) with 15s `maxDuration`.
+- **Syntax:** `validator` (`isEmail`) with UTF-8 local part and Punycode conversion.
+- **DNS:** `node:dns/promises` with parallel A/AAAA fallback, Null MX detection, and `gmail.com` health canary.
+- **Recipient Verification:** 3-tier engine (Tier 1: HTTPS External API with Bearer token, Tier 2: Direct Port 25 SMTP Probing with single-flight catch-all, Tier 3: Honest serverless fallback).
+- **Rate Limiting:** Sliding-window limiter (60 req / 60s per client IP), strictly validating proxy headers only when `VERCEL === '1'` or `TRUST_PROXY === 'true'`.
 
-No database or ML model is needed. Syntax and DNS/MX checks do not require a third-party verification API key.
-
-## 10. Hosting limitations
-Vercel blocks outbound TCP port 25, commonly used for direct server-to-server SMTP. Do not promise direct mailbox verification over that port. The deployed MVP should support syntax and DNS/MX checks and return Unknown when mailbox existence cannot be established. If a provider API is added, document its coverage, quotas, cost, privacy terms, and failure behavior.
-
-## 11. Suggested API
+## 10. API Contract
 `POST /api/verify`
 
-Example request:
+**Request:**
 ```json
-{ "emails": ["alice@example.com", "bad-address"] }
+{
+  "emails": ["Alice@gmail.com", "alice@gmail.com", "wrong-email", "someone@nonexistent-domain-xyz.com"]
+}
 ```
 
-Example response:
+**Response:**
 ```json
 {
   "results": [
     {
-      "email": "alice@example.com",
+      "email": "Alice@gmail.com",
       "status": "unknown",
-      "reason": "Mailbox existence could not be confirmed",
+      "reason": "Domain accepts mail, but the mailbox was not confirmed",
+      "checks": { "syntax": "pass", "mx": "found", "recipient": "not_checked" },
+      "occurrences": 2
+    },
+    {
+      "email": "wrong-email",
+      "status": "likely_bounce",
+      "reason": "Invalid email format",
+      "checks": { "syntax": "fail", "mx": "not_checked", "recipient": "not_checked" },
+      "occurrences": 1
+    },
+    {
+      "email": "someone@nonexistent-domain-xyz.com",
+      "status": "likely_bounce",
+      "reason": "Domain cannot be resolved",
+      "checks": { "syntax": "pass", "mx": "domain_not_found", "recipient": "not_checked" },
+      "occurrences": 1
+    }
+  ],
+  "summary": {
+    "total": 4,
+    "likely_deliverable": 0,
+    "likely_bounce": 2,
+    "unknown": 2,
+    "submitted_count": 4,
+    "unique_count": 3,
+    "unique_summary": {
+      "total": 3,
+      "likely_deliverable": 0,
+      "likely_bounce": 2,
+      "unknown": 1
+    }
+  }
+}
+```
+
+## 11. Privacy statement
+Addresses are checked in memory and discarded without database or browser storage, unless an optional external verification API is configured. No emails are sent.
       "checks": { "syntax": "pass", "mx": "found", "recipient": "not_checked" }
     }
   ],

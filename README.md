@@ -10,20 +10,21 @@ MailCheck accepts up to 1,000 email addresses and returns **Likely Deliverable**
 
 ## Features
 
-- **Bulk verification** — paste up to 1,000 addresses, one per line
+- **Bulk verification** — paste up to 1,000 addresses, one per line (chunks of 50 in UI; API supports up to 100 unique addresses from up to 1,000 raw lines)
 - **Three honest statuses** — Likely Deliverable, Likely Bounce, and Unknown (a valid outcome, not an error)
-- **Syntax validation & RFC limits** — enforces RFC 5321 length limits (254 total, 64 local part) and internationalized domain/punycode support (IDN/EAI)
-- **DNS/MX lookup** — queries domain mail routing with parallel 2000ms A/AAAA fallback, DNS concurrency of 25, 11000ms batch time budget, and RFC 7505 Null MX detection
+- **Syntax validation & RFC limits** — enforces RFC 5321 / RFC 6531 byte-accurate length limits (254 UTF-8 octets total, 64 UTF-8 octets local-part) and internationalized domain/punycode support (IDN/EAI)
+- **DNS/MX lookup & Canary health** — queries domain mail routing with parallel 2000ms A/AAAA fallback, DNS concurrency of 25, 8000ms batch time budget, 15s Vercel `maxDuration`, lazy per-batch `gmail.com` DNS resolver health canary check, and RFC 7505 Null MX detection
 - **SSRF Protection** — uses Node.js `net.BlockList` plus IPv4-in-IPv6 extraction to block connections to loopback (`127.0.0.0/8`, `::1`), private (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`, `fc00::/7`), link-local, multicast, NAT64, 6to4, and IPv4-mapped/compatible private IPv6
+- **Single-Flight Catch-All Detection** — coalesces concurrent catch-all probes per domain via a single-flight Promise cache, preventing duplicate probe traffic to mail servers
 - **Multi-MX Fallback** — stores full priority-sorted MX exchanges and attempts up to the top 2 highest-priority MX hosts if the primary host is unreachable
 - **Narrow 5xx Classification** — strictly narrows SMTP `rejected` verdicts to explicit 550/551/553 mailbox nonexistent responses, classifying policy/reputation/spam blocks (`554`, `5.7.1`) as `unknown`
-- **Application-Level IP Rate Limiting** — sliding-window rate limiter (60 batch requests per 60s per client IP, in-memory per serverless instance, configurable via `RATE_LIMIT_MAX`) returning HTTP 429 with `Retry-After: 60`
-- **Duplicate collapsing** — deduplicates domain case-insensitively while preserving original local-part casing per RFC 5321; identical addresses show as one row with a `× N` badge; counts still sum correctly
-- **Progressive results & Cancel control** — large batches send in chunks of 50 unique addresses (API max 100) with interactive cancellation and retry for failed chunks
-- **OWASP CSV sanitization & clipboard copy** — prefixes formulas (`=`, `+`, `-`, `@`, `\t`, `\r` after optional whitespace) with `'` to prevent spreadsheet injection; exports exact 7 columns (`email,status,reason,syntax,mx,recipient,occurrences`) and copies formatted results with occurrence counts
+- **Application-Level IP Rate Limiting** — sliding-window rate limiter (60 batch requests per 60s per client IP, in-memory per serverless instance, configurable via `RATE_LIMIT_MAX`) returning HTTP 429 with `Retry-After: 60`, strictly trusting proxy headers only when `VERCEL === '1'` or `TRUST_PROXY === 'true'`
+- **Unified Case-Insensitive Deduplication** — deduplicates case-insensitively (`toLowerCase()`) while displaying first-seen casing (`× N` badge) because major email providers treat mailboxes case-insensitively, preventing duplicate ledger rows with identical verdicts
+- **Progressive results & Cancel control** — large batches send in chunks of 50 unique addresses (API max 100 unique / 1,000 raw) with 20000ms client timeout, interactive cancellation (`#cancel-btn`), and retry for failed chunks
+- **OWASP CSV sanitization & clipboard copy** — prefixes formulas (`=`, `+`, `-`, `@`, `|`, `%`, `\t`, `\r`, `\n`, and full-width Unicode triggers `\uFF1D`, `\uFF0B`, `\uFF0D`, `\uFF20`, `\u2212`, `\uFE62`, `\uFE63`, `\uFE66`) with `'` to prevent spreadsheet injection; replaces internal newlines with space; exports exact 7 columns (`email,status,reason,syntax,mx,recipient,occurrences`) and copies formatted results with occurrence counts
 - **Accessible & High-Contrast** — WCAG contrast compliant red text (`#B3290C`), semantic table, `aria-sort`, `aria-pressed`, `aria-live` progress, and visible focus rings
 - **Reduced motion & Plain view toggle** — respects `prefers-reduced-motion` and allows disabling decorative SVG filters
-- **Privacy-first** — Addresses are checked in memory and not stored in any database or browser storage, and no emails are sent. Standard platform request logs may apply, and if an optional external verification API is configured, addresses are sent to that provider under its privacy policy.
+- **Privacy-first** — Addresses are checked in memory and discarded without database or browser storage, unless an optional external verification API is configured. No emails are sent.
 
 ---
 
@@ -67,23 +68,23 @@ The visual style uses an uncoated paper background, two-colour riso-style ink, t
 ```
 Browser (index.html + styles.css + app.js)
   │
-  │ POST /api/verify (up to 50 unique addresses per chunk, 15000ms client timeout)
+  │ POST /api/verify (up to 50 unique addresses per chunk, 20000ms client timeout)
   ▼
-Vercel Node.js Function: api/verify.js (maxDuration: 15s, batch budget: 11000ms)
+Vercel Node.js Function: api/verify.js (maxDuration: 15s, batch budget: 8000ms, hard cutoff: 11000ms)
   ├─ enforces IP rate limit (60 req / 60s per IP, configurable via RATE_LIMIT_MAX)
-  ├─ validates request types, string lengths (<2048 chars), and batch limit (max 100)
-  ├─ case-insensitively deduplicates domains while preserving local-part casing
-  ├─ Stage 1: validates email syntax & RFC 5321 length limits (254 total / 64 local)
-  ├─ Stage 2: queries domain MX records (parallel 2000ms A/AAAA fallback, DNS concurrency 25, RFC 7505 Null MX)
+  ├─ validates request payload (max 64 KB, max 1,000 raw lines, max 100 unique addresses)
+  ├─ case-insensitively deduplicates (toLowerCase) while preserving first-seen display casing & counting occurrences
+  ├─ Stage 1: validates email syntax & RFC 5321 / 6531 UTF-8 byte limits (254 octets total / 64 octets local)
+  ├─ Stage 2: queries domain MX records (parallel 2000ms A/AAAA fallback, DNS concurrency 25, RFC 7505 Null MX, lazy gmail.com canary)
   ├─ Stage 3: bounded-concurrency recipient verification (max 10 concurrent checks):
-  │    ├─ Tier 1. Tested Emailable v1 Adapter over HTTPS (Authorization: Bearer header, 4000ms timeout)
-  │    ├─ Tier 2. Direct SMTP Socket Probe on Port 25 (if enabled, attempts up to top 2 MX hosts, 2500ms timeout)
+  │    ├─ Tier 1. Tested Emailable v1 Adapter over HTTPS (SSRF-protected, Authorization: Bearer, 4000ms timeout)
+  │    ├─ Tier 2. Direct SMTP Socket Probe on Port 25 (if enabled, single-flight catch-all probe, up to top 2 MX hosts, 2500ms timeout)
   │    └─ Default. Honest unknown fallback (Port 25 blocked in serverless)
   ├─ applies conservative classification rules
-  └─ returns structured JSON; no email message is ever sent
+  └─ returns structured JSON with occurrence-weighted and unique summary counts; no email is ever sent
   │
   ▼
-Browser renders stamps, postmarks, and counts progressively
+Browser renders stamps, postmarks, duplicate badges (× N), and pigeonhole counts progressively
 ```
 
 ---
@@ -174,8 +175,8 @@ npm test
 ```json
 {
   "emails": [
+    "Alice@gmail.com",
     "alice@gmail.com",
-    "bob@company.com",
     "wrong-email",
     "someone@nonexistent-domain-xyz.com"
   ]
@@ -187,14 +188,15 @@ npm test
 {
   "results": [
     {
-      "email": "alice@gmail.com",
+      "email": "Alice@gmail.com",
       "status": "unknown",
       "reason": "Domain accepts mail, but the mailbox was not confirmed",
       "checks": {
         "syntax": "pass",
         "mx": "found",
         "recipient": "not_checked"
-      }
+      },
+      "occurrences": 2
     },
     {
       "email": "wrong-email",
@@ -204,14 +206,34 @@ npm test
         "syntax": "fail",
         "mx": "not_checked",
         "recipient": "not_checked"
-      }
+      },
+      "occurrences": 1
+    },
+    {
+      "email": "someone@nonexistent-domain-xyz.com",
+      "status": "likely_bounce",
+      "reason": "Domain cannot be resolved",
+      "checks": {
+        "syntax": "pass",
+        "mx": "domain_not_found",
+        "recipient": "not_checked"
+      },
+      "occurrences": 1
     }
   ],
   "summary": {
-    "total": 2,
+    "total": 4,
     "likely_deliverable": 0,
-    "likely_bounce": 1,
-    "unknown": 1
+    "likely_bounce": 2,
+    "unknown": 2,
+    "submitted_count": 4,
+    "unique_count": 3,
+    "unique_summary": {
+      "total": 3,
+      "likely_deliverable": 0,
+      "likely_bounce": 2,
+      "unknown": 1
+    }
   }
 }
 ```
@@ -220,7 +242,7 @@ npm test
 
 ## Privacy Notice
 
-Addresses are checked in memory and not stored in any database or browser storage, and no emails are sent. Standard platform request logs may apply, and if an optional external verification API is configured, addresses are sent to that provider under its privacy policy.
+Addresses are checked in memory and discarded without database or browser storage, unless an optional external verification API is configured. No emails are sent.
 
 ---
 
@@ -232,24 +254,28 @@ Run the automated test suite:
 npm test
 ```
 
-The test suite uses Node's built-in `node:test` runner and executes 62 automated tests across 17 suites with zero external network dependencies:
+The test suite uses Node's built-in `node:test` runner and executes 80 automated tests across 22 suites with zero external network dependencies:
 - **1 — Syntax validation & RFC 5321 length limits** (>254 chars total, >64 local part)
 - **2 — Internationalized email (EAI / IDN)** (IDN punycode & UTF-8 local part)
-- **3 — Domain mail routing & RFC 7505 Null MX detection**
+- **3 — Domain mail routing & RFC 7505 Null MX detection** (including lazy `gmail.com` canary check for broken sandbox resolvers)
 - **4 — RFC 5321 parallel A / AAAA fallback** on ENODATA with timeout protection
 - **5 — SSRF protection & private IP blocking** (loopback, RFC 1918, link-local, multicast, reserved)
 - **6 — SMTP probing & narrow 5xx classification** (catch-all detection, explicit user-unknown vs spam/policy)
 - **7 — External HTTPS verification API** with Bearer authorization and network fallback
 - **8 — Dependency injection in classifyEmail** (unit test isolation without global mutable state)
-- **9 — Batch size limit & case-insensitive deduplication** (max 100 batch limit)
+- **9 — Batch size limit & case-insensitive deduplication** (max 100 unique, max 1,000 raw lines, first-seen casing)
 - **10 — In-memory sliding-window IP rate limiter** (60 requests / 60s per client IP)
 - **11 — Security & input validation** (XSS payloads, non-string items, HTTP method guards, HTTP 429)
 - **12 — Extended SSRF BlockList & IPv4-in-IPv6** (`net.BlockList`, IPv4-mapped, IPv4-compatible, NAT64, 6to4, deprecated site-local, documentation ranges)
 - **13 — Distinct DNS error reason strings** (ETIMEOUT vs ESERVFAIL / ECONNREFUSED)
-- **14 — Batch time budget enforcement** (11000ms hard deadline prevents serverless 504 timeouts)
+- **14 — Batch time budget enforcement** (8000ms budget, 11000ms hard cutoff prevents serverless timeouts)
 - **15 — normalizeEmailAddress local-part case preservation** (preserves local case, lowercases domain)
-- **16 — IP header trust order for rate limiting** (`x-vercel-forwarded-for` > `x-real-ip` > socket > last hop `x-forwarded-for`)
-- **17 — Comprehensive end-to-end integration verification**
+- **16 — IP header trust order for rate limiting** (strictly enforces `VERCEL === '1'` and `TRUST_PROXY === 'true'`)
+- **17 — UTF-8 byte-accurate length limits** (32 vs 33 two-byte UTF-8 chars, Punycode >253 octets)
+- **18 — Single-flight promise coalescing for SMTP catch-all detection** (5 concurrent queries trigger 1 catch-all probe)
+- **19 — HTTPS protocol & SSRF validation on EMAIL_VERIFICATION_API_URL** (blocks http://, localhost, internal domains, private IPs)
+- **20 — Zero inline style attributes and DOM style assignments** (automated audit of `index.html` and `app.js`)
+- **21 — Hardened CSV sanitization with Unicode & embedded newlines** (ASCII + full-width Unicode formula injection triggers, internal newlines)
 
 ---
 
