@@ -55,6 +55,20 @@
   padding: 0;
 }
 
+[hidden] {
+  display: none !important;
+}
+
+.noscript-banner {
+  padding: 1rem;
+  border: var(--border);
+  background: var(--paper-deep);
+  color: var(--ink-red-text);
+  font-family: var(--font-body);
+  margin-bottom: 1.5rem;
+  text-align: center;
+}
+
 html {
   scroll-behavior: smooth;
 }
@@ -539,7 +553,7 @@ body {
   width: 100%;
   border-collapse: collapse;
   font-family: var(--font-body);
-  font-size: 0.95rem;
+  font-size: 1rem;
 }
 
 .ledger caption {
@@ -606,6 +620,7 @@ body {
 .ledger tbody td {
   padding: 0.75rem 0.5rem;
   vertical-align: top;
+  font-size: 1rem;
 }
 
 .ledger .col-num {
@@ -639,7 +654,7 @@ body {
 
 .ledger .col-reason {
   min-width: 180px;
-  font-size: 0.9rem;
+  font-size: 1rem;
 }
 
 .ledger .col-postmarks {
@@ -673,7 +688,7 @@ body {
 }
 
 .stamp-primary {
-  font-size: 0.85rem;
+  font-size: 0.95rem;
   font-weight: 400;
   letter-spacing: 0.06em;
   display: block;
@@ -702,8 +717,8 @@ body {
 
 /* Likely Bounce */
 .stamp-likely_bounce {
-  color: var(--ink-red);
-  border: 3px double var(--ink-red);
+  color: var(--ink-red-text);
+  border: 3px double var(--ink-red-text);
   filter: url(#ink-rough);
 }
 

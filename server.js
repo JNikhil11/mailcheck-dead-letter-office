@@ -1,6 +1,6 @@
 import { createServer } from "node:http";
 import { readFile } from "node:fs/promises";
-import { extname, join, normalize } from "node:path";
+import { extname, join, normalize, resolve, relative, isAbsolute } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
@@ -70,7 +70,7 @@ const server = createServer(async (req, rawRes) => {
 
       // Lazy-import the handler so changes are picked up without restart
       const { default: handler } = await import("./api/verify.js");
-      const mockReq = { method: "POST", body };
+      const mockReq = { method: "POST", body, headers: req.headers, socket: req.socket };
       const mockRes = createMockRes(rawRes);
       await handler(mockReq, mockRes);
     } catch (err) {
@@ -84,19 +84,27 @@ const server = createServer(async (req, rawRes) => {
   // Return 405 for non-POST on the API route
   if (pathname === "/api/verify") {
     const { default: handler } = await import("./api/verify.js");
-    const mockReq = { method: req.method, body: {} };
+    const mockReq = { method: req.method, body: {}, headers: req.headers, socket: req.socket };
     const mockRes = createMockRes(rawRes);
     await handler(mockReq, mockRes);
     return;
   }
 
   // ---------- Static file serving ----------
-  let filePath = pathname === "/" ? "/index.html" : pathname;
+  let filePath = pathname === "/" ? "index.html" : pathname.replace(/^\/+/, "");
 
-  // Security: prevent directory traversal
-  const resolved = normalize(join(__dirname, filePath));
-  if (!resolved.startsWith(__dirname)) {
-    rawRes.writeHead(403);
+  // Security: prevent directory traversal and block sensitive dirs
+  const resolved = resolve(__dirname, filePath);
+  const rel = relative(__dirname, resolved);
+  if (
+    rel.startsWith("..") ||
+    isAbsolute(rel) ||
+    rel.startsWith("Sources") ||
+    rel.startsWith("tests") ||
+    rel.startsWith(".git") ||
+    rel.startsWith(".github")
+  ) {
+    rawRes.writeHead(403, { "Content-Type": "text/plain" });
     rawRes.end("Forbidden");
     return;
   }

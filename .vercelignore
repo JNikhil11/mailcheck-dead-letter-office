@@ -1,0 +1,6 @@
+Sources/
+tests/
+server.js
+.github/
+*.md
+scratch/

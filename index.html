@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>MailCheck — The Dead Letter Office</title>
   <meta name="description" content="Bulk email address verification. Paste addresses, get honest results.">
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' fill='%23EFE7D3' stroke='%231B1A17' stroke-width='2'/%3E%3Ccircle cx='16' cy='16' r='10' fill='none' stroke='%231F3FBF' stroke-width='2' stroke-dasharray='3 2'/%3E%3Cpath d='M11 16l3 3 7-7' fill='none' stroke='%231F3FBF' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E">
   <link rel="stylesheet" href="styles.css">
 </head>
 <body>
@@ -40,6 +41,12 @@
 
   <div class="page-wrapper">
 
+    <noscript>
+      <div class="noscript-banner" role="alert">
+        MailCheck requires JavaScript to verify email addresses and render verification ledgers. Please enable JavaScript to use the sorting office.
+      </div>
+    </noscript>
+
     <!-- ============================================================
          MASTHEAD
          ============================================================ -->
@@ -63,19 +70,20 @@
           class="intake-textarea"
           id="email-input"
           rows="10"
-          placeholder="employee@company.com&#10;alice@gmail.com&#10;user@example.com&#10;someone@nonexistent-domain-xyz.com&#10;wrong-email"
+          placeholder="alice@gmail.com&#10;bob@company.com&#10;wrong-email&#10;someone@nonexistent-domain-xyz.com"
           spellcheck="false"
           autocomplete="off"
         ></textarea>
       </div>
       <div class="intake-meta">
         <span class="address-counter" id="address-counter" aria-live="polite">0 addresses · max 1,000</span>
-        <div class="validation-note" id="validation-note" role="alert">
+        <div class="validation-note" id="validation-note" role="alert" hidden>
           Too many addresses. The sorting office handles up to 1,000 at a time.
         </div>
       </div>
       <div class="intake-buttons">
         <button class="btn btn-primary" id="verify-btn" type="button">Verify</button>
+        <button class="btn btn-secondary" id="cancel-btn" type="button" hidden>Cancel</button>
         <button class="btn btn-secondary" id="clear-btn" type="button">Clear</button>
         <button class="btn btn-tertiary" id="sample-btn" type="button">Load sample</button>
       </div>
@@ -84,6 +92,7 @@
     <!-- Collapsed intake summary -->
     <div class="intake-collapsed" id="intake-collapsed">
       <span id="intake-summary-text"></span>
+      <button class="btn btn-secondary" id="cancel-btn-collapsed" type="button" hidden>Cancel</button>
       <button class="edit-list-btn" id="edit-list-btn" type="button">Edit list</button>
     </div>
 
@@ -114,14 +123,14 @@
     <!-- ============================================================
          PROGRESS STRIP
          ============================================================ -->
-    <div class="progress-strip" id="progress-strip" aria-live="polite" role="status">
+    <div class="progress-strip" id="progress-strip" aria-live="polite" role="status" hidden>
       Sorting…
     </div>
 
     <!-- ============================================================
          ERROR BANNER
          ============================================================ -->
-    <div class="error-banner" id="error-banner" role="alert">
+    <div class="error-banner" id="error-banner" role="alert" hidden>
       <span id="error-message">The request failed. Nothing was sent to any address.</span>
       <button class="btn btn-secondary" id="retry-btn" type="button">Try again</button>
     </div>
@@ -163,7 +172,7 @@
          ============================================================ -->
     <footer class="footnote" id="footnote">
       <p>A postmark proves a letter was posted, not that anyone lives at the address. MX records show that a domain can receive mail, not that a particular mailbox exists. Results are predictions, not guarantees.</p>
-      <p>Addresses are checked and discarded. Nothing is stored and no emails are sent.</p>
+      <p>MailCheck does not intentionally store submitted address lists in a database or browser storage, and no email messages are sent. If an optional external verification provider is configured, submitted addresses are checked via that provider.</p>
       <div class="footnote-controls">
         <button class="plain-view-btn" id="plain-view-btn" type="button" aria-pressed="false" data-texture="off">Plain view</button>
       </div>

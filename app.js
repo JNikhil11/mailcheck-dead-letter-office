@@ -9,6 +9,7 @@ const CHUNK_SIZE = 100;
 const ANIMATE_FIRST_N = 30;
 const STAGGER_MS = 15;
 const API_URL = '/api/verify';
+const CLIENT_TIMEOUT_MS = 15000;
 
 const STATUS_LABELS = {
   likely_deliverable: { primary: 'LIKELY DELIVERABLE', secondary: 'CLEARED FOR DELIVERY', glyph: '✓', cssClass: 'stamp-likely_deliverable' },
@@ -24,13 +25,12 @@ const POSTMARK_DISPLAY = {
   recipient: { not_checked: 'NOT CHECKED', accepted: 'ACCEPTED', rejected: 'REJECTED', inconclusive: 'INCONCLUSIVE' },
 };
 
+// Design Document §15 sample addresses
 const SAMPLE_ADDRESSES = [
-  'employee@company.com',
   'alice@gmail.com',
-  'user@example.com',
-  'someone@nonexistent-domain-xyz.com',
+  'bob@company.com',
   'wrong-email',
-  'employee@company.com',
+  'someone@nonexistent-domain-xyz.com',
 ];
 
 // --- State ---
@@ -39,12 +39,18 @@ let activeFilter = 'all';
 let sortColumn = null;
 let sortDirection = 'none';
 let isVerifying = false;
+let currentSessionId = 0;
+let activeAbortController = null;
+let lastFailedChunks = [];
+let lastCounts = new Map();
 
 // --- DOM References ---
 const $textarea = document.getElementById('email-input');
 const $counter = document.getElementById('address-counter');
 const $validationNote = document.getElementById('validation-note');
 const $verifyBtn = document.getElementById('verify-btn');
+const $cancelBtn = document.getElementById('cancel-btn');
+const $cancelBtnCollapsed = document.getElementById('cancel-btn-collapsed');
 const $clearBtn = document.getElementById('clear-btn');
 const $sampleBtn = document.getElementById('sample-btn');
 const $intakeSlip = document.getElementById('intake-slip');
@@ -84,25 +90,21 @@ function setPostmarkDate() {
 
 function bindEvents() {
   $textarea.addEventListener('input', updateCounter);
-  $verifyBtn.addEventListener('click', handleVerify);
+  $verifyBtn.addEventListener('click', () => handleVerify(false));
+  if ($cancelBtn) $cancelBtn.addEventListener('click', handleCancel);
+  if ($cancelBtnCollapsed) $cancelBtnCollapsed.addEventListener('click', handleCancel);
   $clearBtn.addEventListener('click', handleClear);
   $sampleBtn.addEventListener('click', handleLoadSample);
   $editListBtn.addEventListener('click', handleEditList);
-  $retryBtn.addEventListener('click', handleVerify);
+  $retryBtn.addEventListener('click', handleRetry);
   $csvBtn.addEventListener('click', handleExportCSV);
   $copyBtn.addEventListener('click', handleCopyResults);
   $plainViewBtn.addEventListener('click', handlePlainViewToggle);
 
-  // Pigeonhole filter clicks
+  // Pigeonhole filter clicks (native buttons trigger on click/enter/space)
   document.querySelectorAll('.pigeonhole').forEach(btn => {
     btn.addEventListener('click', () => {
       setActiveFilter(btn.dataset.filter);
-    });
-    btn.addEventListener('keydown', (e) => {
-      if (e.key === 'Enter' || e.key === ' ') {
-        e.preventDefault();
-        setActiveFilter(btn.dataset.filter);
-      }
     });
   });
 
@@ -130,10 +132,12 @@ function updateCounter() {
 
   if (count > MAX_ADDRESSES) {
     $counter.classList.add('over-limit');
+    $validationNote.hidden = false;
     $validationNote.classList.add('visible');
     $verifyBtn.disabled = true;
   } else {
     $counter.classList.remove('over-limit');
+    $validationNote.hidden = true;
     $validationNote.classList.remove('visible');
     $verifyBtn.disabled = false;
   }
@@ -157,7 +161,7 @@ function stampRotation(email) {
 }
 
 /**
- * Deduplicate addresses, return { unique: string[], counts: Map<string, number> }
+ * Deduplicate addresses case-insensitively, returning { unique: string[], counts: Map<string, number> }
  */
 function deduplicateAddresses(lines) {
   const counts = new Map();
@@ -174,146 +178,228 @@ function deduplicateAddresses(lines) {
   return { unique, counts };
 }
 
+// --- Cancel & Session Guards ---
+function handleCancel() {
+  if (!isVerifying) return;
+  if (activeAbortController) {
+    activeAbortController.abort();
+    activeAbortController = null;
+  }
+  currentSessionId++;
+  isVerifying = false;
+  setVerifyingUI(false);
+  $progressStrip.textContent = 'Sorting cancelled';
+}
+
+function setVerifyingUI(verifying) {
+  if (verifying) {
+    $verifyBtn.textContent = 'Sorting…';
+    $verifyBtn.disabled = true;
+    if ($cancelBtn) $cancelBtn.hidden = false;
+    if ($cancelBtnCollapsed) $cancelBtnCollapsed.hidden = false;
+  } else {
+    $verifyBtn.textContent = 'Verify';
+    $verifyBtn.disabled = false;
+    if ($cancelBtn) $cancelBtn.hidden = true;
+    if ($cancelBtnCollapsed) $cancelBtnCollapsed.hidden = true;
+  }
+}
+
 // --- Verify Flow ---
-async function handleVerify() {
+async function handleVerify(isRetry = false) {
   if (isVerifying) return;
 
   const lines = getLines();
   if (lines.length === 0) return;
   if (lines.length > MAX_ADDRESSES) return;
 
+  const sessionId = ++currentSessionId;
   isVerifying = true;
-  allResults = [];
-  activeFilter = 'all';
+  setVerifyingUI(true);
 
-  // Collapse intake slip
-  $intakeSlip.style.display = 'none';
-  $intakeCollapsed.classList.add('visible');
-  $intakeSummary.textContent = `${lines.length.toLocaleString()} address${lines.length !== 1 ? 'es' : ''} submitted`;
+  if (!isRetry) {
+    allResults = [];
+    lastFailedChunks = [];
+    activeFilter = 'all';
 
-  // Show results area
-  $resultsDivider.style.display = '';
-  $pigeonholes.classList.add('visible');
-  $ledgerWrap.classList.add('visible');
-  $progressStrip.classList.add('visible');
-  $errorBanner.classList.remove('visible');
-  $exportButtons.classList.remove('visible');
+    // Collapse intake slip and move keyboard focus to Edit list
+    $intakeSlip.style.display = 'none';
+    $intakeCollapsed.classList.add('visible');
+    $intakeSummary.textContent = `${lines.length.toLocaleString()} address${lines.length !== 1 ? 'es' : ''} submitted`;
+    $editListBtn.focus();
 
-  // Reset pigeonhole buttons
-  document.querySelectorAll('.pigeonhole').forEach(btn => {
-    btn.setAttribute('aria-pressed', btn.dataset.filter === 'all' ? 'true' : 'false');
-  });
+    // Show results area
+    $resultsDivider.style.display = '';
+    $pigeonholes.classList.add('visible');
+    $ledgerWrap.classList.add('visible');
+    $progressStrip.hidden = false;
+    $progressStrip.classList.add('visible');
+    $errorBanner.hidden = true;
+    $errorBanner.classList.remove('visible');
+    $exportButtons.classList.remove('visible');
 
-  // Reset sort
-  sortColumn = null;
-  sortDirection = 'none';
-  document.querySelectorAll('.ledger thead th.sortable').forEach(th => {
-    th.setAttribute('aria-sort', 'none');
-  });
+    // Reset pigeonhole buttons
+    document.querySelectorAll('.pigeonhole').forEach(btn => {
+      btn.setAttribute('aria-pressed', btn.dataset.filter === 'all' ? 'true' : 'false');
+    });
+
+    // Reset sort
+    sortColumn = null;
+    sortDirection = 'none';
+    document.querySelectorAll('.ledger thead th.sortable').forEach(th => {
+      th.setAttribute('aria-sort', 'none');
+    });
+
+    // Clear ledger
+    $ledgerBody.innerHTML = '';
+  } else {
+    $errorBanner.hidden = true;
+    $errorBanner.classList.remove('visible');
+  }
 
   // Deduplicate
   const { unique, counts } = deduplicateAddresses(lines);
-
-  // Disable verify button
-  $verifyBtn.textContent = 'Sorting…';
-  $verifyBtn.disabled = true;
-
-  // Clear ledger
-  $ledgerBody.innerHTML = '';
+  lastCounts = counts;
   updatePigeonholeCounts(counts);
 
-  // Chunk and send
-  const chunks = [];
-  for (let i = 0; i < unique.length; i += CHUNK_SIZE) {
-    chunks.push(unique.slice(i, i + CHUNK_SIZE));
+  // Determine chunks to process
+  let chunksToProcess = [];
+  if (isRetry && lastFailedChunks.length > 0) {
+    chunksToProcess = [...lastFailedChunks];
+    lastFailedChunks = [];
+  } else {
+    for (let i = 0; i < unique.length; i += CHUNK_SIZE) {
+      chunksToProcess.push(unique.slice(i, i + CHUNK_SIZE));
+    }
   }
 
   const totalAddresses = lines.length;
-  let processedCount = 0;
+  let processedCount = allResults.reduce((sum, r) => sum + (r.count || 1), 0);
+  let hasFailure = false;
+  let failureReason = '';
 
-  for (let ci = 0; ci < chunks.length; ci++) {
-    const chunk = chunks[ci];
-    $progressStrip.textContent = `Sorted ${processedCount.toLocaleString()} of ${totalAddresses.toLocaleString()}`;
+  try {
+    for (let ci = 0; ci < chunksToProcess.length; ci++) {
+      if (sessionId !== currentSessionId) return;
 
-    try {
-      const response = await fetch(API_URL, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ emails: chunk }),
-      });
+      const chunk = chunksToProcess[ci];
+      $progressStrip.textContent = `Sorted ${processedCount.toLocaleString()} of ${totalAddresses.toLocaleString()}`;
 
-      if (!response.ok) {
-        const errData = await response.json().catch(() => ({}));
-        throw new Error(errData.error || `Server error: ${response.status}`);
-      }
+      const controller = new AbortController();
+      activeAbortController = controller;
+      const timeoutId = setTimeout(() => controller.abort(), CLIENT_TIMEOUT_MS);
 
-      const data = await response.json();
+      try {
+        const response = await fetch(API_URL, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ emails: chunk }),
+          signal: controller.signal,
+        });
 
-      // Merge results with duplicate counts
-      for (const result of data.results) {
-        const lowerEmail = result.email.toLowerCase();
-        const count = counts.get(lowerEmail) || 1;
-        allResults.push({ ...result, count });
-      }
+        if (sessionId !== currentSessionId) return;
 
-      // Render this chunk's rows with staggered animation
-      renderChunkRows(data.results, counts, ci);
+        if (!response.ok) {
+          const errData = await response.json().catch(() => ({}));
+          throw new Error(errData.error || `Server error (${response.status})`);
+        }
 
-      processedCount += chunk.reduce((sum, email) => {
-        const lower = email.toLowerCase();
-        return sum + (counts.get(lower) || 1);
-      }, 0);
+        const data = await response.json();
+        if (sessionId !== currentSessionId) return;
 
-    } catch (err) {
-      // Mark failed chunk rows as unknown
-      for (const email of chunk) {
-        const lowerEmail = email.toLowerCase();
-        const count = counts.get(lowerEmail) || 1;
-        const failResult = {
+        // If previously this chunk was rendered as failed, remove old placeholder rows
+        for (const email of chunk) {
+          const lower = email.toLowerCase();
+          const existingIdx = allResults.findIndex(r => r.email.toLowerCase() === lower);
+          if (existingIdx !== -1) {
+            allResults.splice(existingIdx, 1);
+            const oldRow = $ledgerBody.querySelector(`tr[data-email="${CSS.escape(email)}"]`);
+            if (oldRow) oldRow.remove();
+          }
+        }
+
+        // Merge results with duplicate counts
+        for (const result of data.results) {
+          const lowerEmail = result.email.toLowerCase();
+          const count = counts.get(lowerEmail) || 1;
+          allResults.push({ ...result, count });
+        }
+
+        // Render rows
+        renderChunkRows(data.results, counts, ci);
+
+        processedCount += chunk.reduce((sum, email) => {
+          const lower = email.toLowerCase();
+          return sum + (counts.get(lower) || 1);
+        }, 0);
+
+      } catch (err) {
+        if (sessionId !== currentSessionId) return;
+
+        hasFailure = true;
+        failureReason = err.name === 'AbortError' ? 'The request timed out.' : (err.message || 'Network error');
+        lastFailedChunks.push(chunk);
+
+        // Render placeholder rows marked as unknown
+        const failResults = chunk.map(email => ({
           email,
           status: 'unknown',
           reason: 'This batch could not be checked. Try again.',
           checks: { syntax: 'not_checked', mx: 'not_checked', recipient: 'not_checked' },
-          count,
-        };
-        allResults.push(failResult);
+        }));
+
+        for (const res of failResults) {
+          const lowerEmail = res.email.toLowerCase();
+          const count = counts.get(lowerEmail) || 1;
+          allResults.push({ ...res, count });
+        }
+
+        renderChunkRows(failResults, counts, ci);
+
+        processedCount += chunk.reduce((sum, email) => {
+          const lower = email.toLowerCase();
+          return sum + (counts.get(lower) || 1);
+        }, 0);
+      } finally {
+        clearTimeout(timeoutId);
+        activeAbortController = null;
       }
-      renderChunkRows(
-        chunk.map(email => ({
-          email,
-          status: 'unknown',
-          reason: 'This batch could not be checked. Try again.',
-          checks: { syntax: 'not_checked', mx: 'not_checked', recipient: 'not_checked' },
-        })),
-        counts,
-        ci
-      );
-      processedCount += chunk.reduce((sum, email) => {
-        const lower = email.toLowerCase();
-        return sum + (counts.get(lower) || 1);
-      }, 0);
+
+      updatePigeonholeCounts(counts);
     }
+  } finally {
+    if (sessionId === currentSessionId) {
+      isVerifying = false;
+      setVerifyingUI(false);
 
-    updatePigeonholeCounts(counts);
+      if (lastFailedChunks.length === chunksToProcess.length && chunksToProcess.length > 0) {
+        // Complete failure
+        $errorBanner.hidden = false;
+        $errorBanner.classList.add('visible');
+        $errorMessage.textContent = `The request failed. Nothing was sent to any address. (${failureReason})`;
+        $progressStrip.textContent = 'Sorting failed — see notice above';
+      } else if (lastFailedChunks.length > 0) {
+        // Partial failure
+        $errorBanner.hidden = false;
+        $errorBanner.classList.add('visible');
+        $errorMessage.textContent = `Some address batches could not be checked. (${failureReason})`;
+        $progressStrip.textContent = 'Sorting finished with errors — some addresses could not be checked';
+      } else {
+        // Full success
+        $errorBanner.hidden = true;
+        $errorBanner.classList.remove('visible');
+        $progressStrip.textContent = 'Sorting complete';
+      }
+
+      if (allResults.length > 0) {
+        $exportButtons.classList.add('visible');
+      }
+    }
   }
+}
 
-  // Done
-  $progressStrip.textContent = 'Sorting complete';
-  $verifyBtn.textContent = 'Verify';
-  $verifyBtn.disabled = false;
-  isVerifying = false;
-
-  // Show export buttons
-  if (allResults.length > 0) {
-    $exportButtons.classList.add('visible');
-  }
-
-  // Focus the ledger caption
-  const caption = document.querySelector('.ledger caption');
-  if (caption) {
-    caption.setAttribute('tabindex', '-1');
-    caption.focus();
-  }
+function handleRetry() {
+  handleVerify(lastFailedChunks.length > 0);
 }
 
 function renderChunkRows(results, counts, chunkIndex) {
@@ -331,7 +417,6 @@ function renderChunkRows(results, counts, chunkIndex) {
       if (stamp) {
         stamp.classList.add('stamp-animate');
         stamp.style.animationDelay = `${i * STAGGER_MS}ms`;
-        // Set final rotation
         const rotation = stampRotation(result.email);
         stamp.style.setProperty('--stamp-rotation', `${rotation}deg`);
       }
@@ -445,7 +530,6 @@ function createPostmarks(checks) {
     stateSpan.textContent = displayLabel;
     mark.appendChild(stateSpan);
 
-    // Screen reader text
     const srSpan = document.createElement('span');
     srSpan.className = 'sr-only';
     srSpan.textContent = `${checkName.charAt(0).toUpperCase() + checkName.slice(1)} check: ${displayLabel.toLowerCase()}`;
@@ -497,7 +581,6 @@ function applyFilter() {
     }
   });
 
-  // Show empty message if no rows match filter
   const existing = $ledgerBody.querySelector('.ledger-empty-row');
   if (existing) existing.remove();
 
@@ -511,7 +594,6 @@ function applyFilter() {
     $ledgerBody.appendChild(emptyRow);
   }
 
-  // Renumber visible rows
   let num = 0;
   rows.forEach(row => {
     if (row.style.display !== 'none') {
@@ -526,7 +608,6 @@ function applyFilter() {
 function handleSort(th) {
   const col = th.dataset.sort;
 
-  // Toggle sort direction
   if (sortColumn === col) {
     sortDirection = sortDirection === 'ascending' ? 'descending' : 'ascending';
   } else {
@@ -534,12 +615,10 @@ function handleSort(th) {
     sortDirection = 'ascending';
   }
 
-  // Update aria-sort on all headers
   document.querySelectorAll('.ledger thead th.sortable').forEach(header => {
     header.setAttribute('aria-sort', header.dataset.sort === col ? sortDirection : 'none');
   });
 
-  // Sort the rows
   const rows = Array.from($ledgerBody.querySelectorAll('tr:not(.ledger-empty-row)'));
   rows.sort((a, b) => {
     let aVal, bVal;
@@ -556,17 +635,19 @@ function handleSort(th) {
     return 0;
   });
 
-  // Re-append sorted rows
   rows.forEach(row => $ledgerBody.appendChild(row));
-
-  // Re-apply filter and numbering
   applyFilter();
 }
 
 // --- Clear ---
 function handleClear() {
+  if (isVerifying) {
+    handleCancel();
+  }
+
   $textarea.value = '';
   allResults = [];
+  lastFailedChunks = [];
   activeFilter = 'all';
   sortColumn = null;
   sortDirection = 'none';
@@ -576,7 +657,9 @@ function handleClear() {
   $intakeSlip.style.display = '';
   $intakeCollapsed.classList.remove('visible');
   $pigeonholes.classList.remove('visible');
+  $progressStrip.hidden = true;
   $progressStrip.classList.remove('visible');
+  $errorBanner.hidden = true;
   $errorBanner.classList.remove('visible');
   $exportButtons.classList.remove('visible');
   $ledgerWrap.classList.remove('visible');
@@ -603,28 +686,33 @@ function handleLoadSample() {
 
 // --- Edit List ---
 function handleEditList() {
+  if (isVerifying) {
+    handleCancel();
+  }
+
   $intakeSlip.style.display = '';
   $intakeCollapsed.classList.remove('visible');
   $textarea.focus();
 }
 
-// --- Export CSV ---
+// --- Export CSV (with OWASP CSV formula injection sanitization) ---
 function handleExportCSV() {
   if (allResults.length === 0) return;
 
-  const header = 'email,status,reason,syntax,mx,recipient';
+  const header = 'email,status,reason,syntax,mx,recipient,occurrences';
   const rows = allResults.map(r => {
     return [
-      csvEscape(r.email),
-      csvEscape(r.status),
-      csvEscape(r.reason),
-      csvEscape(r.checks.syntax),
-      csvEscape(r.checks.mx),
-      csvEscape(r.checks.recipient),
+      csvSanitize(r.email),
+      csvSanitize(r.status),
+      csvSanitize(r.reason),
+      csvSanitize(r.checks?.syntax || 'not_checked'),
+      csvSanitize(r.checks?.mx || 'not_checked'),
+      csvSanitize(r.checks?.recipient || 'not_checked'),
+      csvSanitize(r.count || 1),
     ].join(',');
   });
 
-  const csv = [header, ...rows].join('\n');
+  const csv = [header, ...rows].join('\r\n');
   const blob = new Blob([csv], { type: 'text/csv;charset=utf-8;' });
   const url = URL.createObjectURL(blob);
   const a = document.createElement('a');
@@ -634,9 +722,16 @@ function handleExportCSV() {
   URL.revokeObjectURL(url);
 }
 
-function csvEscape(val) {
-  const str = String(val);
-  if (str.includes(',') || str.includes('"') || str.includes('\n')) {
+/**
+ * Sanitize cell values against OWASP CSV formula injection.
+ * If value starts with =, +, -, @, tab, or carriage return, prefix with single quote.
+ */
+function csvSanitize(val) {
+  let str = String(val ?? '');
+  if (/^\s*[=+\-@\t\r]/.test(str)) {
+    str = "'" + str;
+  }
+  if (str.includes(',') || str.includes('"') || str.includes('\n') || str.includes('\r')) {
     return `"${str.replace(/"/g, '""')}"`;
   }
   return str;
@@ -647,7 +742,8 @@ async function handleCopyResults() {
   if (allResults.length === 0) return;
 
   const text = allResults.map(r => {
-    return `${r.email}\t${r.status}\t${r.reason}`;
+    const occurrences = (r.count && r.count > 1) ? ` (×${r.count})` : '';
+    return `${r.email}${occurrences}\t${r.status}\t${r.reason}`;
   }).join('\n');
 
   try {
@@ -656,15 +752,23 @@ async function handleCopyResults() {
     $copyBtn.textContent = 'Copied!';
     setTimeout(() => { $copyBtn.textContent = originalText; }, 2000);
   } catch {
-    // Fallback
+    // Fallback using textarea + execCommand
     const ta = document.createElement('textarea');
     ta.value = text;
+    ta.style.position = 'fixed';
+    ta.style.opacity = '0';
     document.body.appendChild(ta);
     ta.select();
-    document.execCommand('copy');
+    const successful = document.execCommand('copy');
     document.body.removeChild(ta);
-    $copyBtn.textContent = 'Copied!';
-    setTimeout(() => { $copyBtn.textContent = 'Copy results'; }, 2000);
+
+    if (successful) {
+      $copyBtn.textContent = 'Copied!';
+      setTimeout(() => { $copyBtn.textContent = 'Copy results'; }, 2000);
+    } else {
+      $copyBtn.textContent = 'Copy failed';
+      setTimeout(() => { $copyBtn.textContent = 'Copy results'; }, 2000);
+    }
   }
 }
 
